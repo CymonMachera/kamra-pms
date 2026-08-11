@@ -257,11 +257,10 @@ jobs:
       - name: Fetch the archive off the server
         run: |
           mkdir -p archive ~/.ssh
-          printf '%s
-' "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_deploy
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
-          scp -i ~/.ssh/id_deploy             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/root/backups/qloapps-archive.tar.gz             archive/
+          scp -i ~/.ssh/id_deploy ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/root/backups/qloapps-archive.tar.gz archive/
           ls -lh archive/
 
       - name: Keep it as a downloadable artifact
