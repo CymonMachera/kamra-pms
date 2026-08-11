@@ -227,12 +227,16 @@ jobs:
               docker volume rm "$v" 2>/dev/null || true
             done
             # Discover the real QloApps volumes rather than assuming their names
-            VOLS=$(docker volume ls -q | grep -E '^citizen-lodge' || true)
+            VOLS=$(docker volume ls -q | grep -E '^citizen-lodge_' || true)
             if [ -z "$VOLS" ]; then
               echo "No citizen-lodge volumes on this host - nothing to archive or purge."
               exit 1
             fi
             echo "volumes found:"; echo "$VOLS" | sed 's/^/  /'
+            # Hard guard: never touch anything belonging to the live Kamra stack
+            if echo "$VOLS" | grep -q 'kamra'; then
+              echo "FATAL: selection includes a Kamra volume - aborting."; exit 1
+            fi
             MOUNTS=""
             for v in $VOLS; do MOUNTS="$MOUNTS -v $v:/data/$v:ro"; done
             # File-level archive: no DB credentials needed; captures database,
@@ -251,14 +255,14 @@ jobs:
               && echo "verified: citizenlodge database present in archive"
 
       - name: Fetch the archive off the server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          source: /root/backups/qloapps-archive.tar.gz
-          target: ./archive/
-          strip_components: 2
+        run: |
+          mkdir -p archive ~/.ssh
+          printf '%s
+' "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          scp -i ~/.ssh/id_deploy             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/root/backups/qloapps-archive.tar.gz             archive/
+          ls -lh archive/
 
       - name: Keep it as a downloadable artifact
         uses: actions/upload-artifact@v4
@@ -277,7 +281,8 @@ jobs:
           script: |
             set -e
             docker rm -f citizen-lodge 2>/dev/null || true
-            for v in $(docker volume ls -q | grep -E '^citizen-lodge' || true); do
+            for v in $(docker volume ls -q | grep -E '^citizen-lodge_' || true); do
+              case "$v" in *kamra*) echo "skipping $v (Kamra)"; continue;; esac
               docker volume rm "$v" 2>/dev/null || true
             done
             docker rmi webkul/qloapps_docker:latest 2>/dev/null || true
