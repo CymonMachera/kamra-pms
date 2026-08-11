@@ -24,6 +24,10 @@ on:
         description: "Add swap and report memory headroom (safe, idempotent)"
         type: boolean
         default: false
+      seed_lodge:
+        description: "Apply the property/room seed held in LODGE_SEED_B64 (idempotent)"
+        type: boolean
+        default: false
 
 # One deploy at a time - concurrent runs fight over container names on the server
 concurrency:
@@ -35,7 +39,7 @@ env:
 
 jobs:
   build:
-    if: ${{ !inputs.purge_qloapps && !inputs.tune_server }}
+    if: ${{ !inputs.purge_qloapps && !inputs.tune_server && !inputs.seed_lodge }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -83,7 +87,7 @@ jobs:
 
   deploy:
     needs: build
-    if: ${{ !inputs.purge_qloapps && !inputs.tune_server }}
+    if: ${{ !inputs.purge_qloapps && !inputs.tune_server && !inputs.seed_lodge }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -291,3 +295,25 @@ jobs:
             echo "=== QloApps removed. Disk now: ==="
             df -h / | awk 'NR==2{print $4" free of "$2}'
             free -h | awk 'NR==2{print $7" RAM available"}'
+
+  seed-lodge:
+    if: ${{ inputs.seed_lodge }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply lodge seed from secret
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          envs: SEED_B64
+          command_timeout: 15m
+          script: |
+            set -e
+            cd /opt/citizen-lodge-kamra
+            SITE="${{ secrets.KAMRA_SITE }}"
+            # decode into the container, run once, delete - nothing persists on disk
+            echo "${{ secrets.LODGE_SEED_B64 }}" | base64 -d > /tmp/seed_lodge.py
+            docker compose cp /tmp/seed_lodge.py backend:/tmp/seed_lodge.py
+            rm -f /tmp/seed_lodge.py
+            docker compose exec -T backend bash -c               "cp /tmp/seed_lodge.py apps/kamra/kamra/scripts/_seed_lodge.py &&                bench --site '$SITE' execute kamra.scripts._seed_lodge.execute;                rm -f apps/kamra/kamra/scripts/_seed_lodge.py /tmp/seed_lodge.py"
