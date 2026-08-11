@@ -145,6 +145,15 @@ jobs:
             # Cutover: hand the public domain from QloApps to Kamra
             if [ "${{ inputs.cutover }}" = "true" ]; then
               echo "=== CUTOVER ==="
+              # verify Kamra answers locally before handing it the domain
+              code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $SITE" http://127.0.0.1:8083/login || echo 000)
+              if [ "$code" != "200" ]; then
+                echo "Kamra not healthy (HTTP $code) - aborting cutover, QloApps untouched"
+                exit 1
+              fi
+              # keep the previous vhost so rollback is one copy away
+              cp -n /etc/nginx/sites-available/citizen.conf \
+                    /root/backups/nginx-citizen-qloapps.conf.bak 2>/dev/null || true
               cp nginx-citizen.conf /etc/nginx/sites-available/citizen.conf
               nginx -t && systemctl reload nginx
               docker stop citizen-lodge || true
