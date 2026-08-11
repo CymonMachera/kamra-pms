@@ -16,6 +16,10 @@ on:
         description: "DANGER: drop and recreate the site (destroys lodge data)"
         type: boolean
         default: false
+      purge_qloapps:
+        description: "Remove the retired QloApps stack (archives its DB first)"
+        type: boolean
+        default: false
 
 # One deploy at a time - concurrent runs fight over container names on the server
 concurrency:
@@ -167,3 +171,63 @@ jobs:
             fi
 
             docker image prune -f
+
+  purge-qloapps:
+    if: ${{ inputs.purge_qloapps }}
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the archive exists on the server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -e
+            LATEST=$(ls -1t /root/backups/qloapps-final-*.sql.gz 2>/dev/null | head -1)
+            if [ -z "$LATEST" ]; then
+              echo "No QloApps archive found - refusing to purge."; exit 1
+            fi
+            SIZE=$(stat -c%s "$LATEST")
+            echo "archive: $LATEST ($SIZE bytes)"
+            if [ "$SIZE" -lt 10000 ]; then
+              echo "Archive suspiciously small - refusing to purge."; exit 1
+            fi
+            cp "$LATEST" /root/backups/qloapps-archive.sql.gz
+
+      - name: Fetch the archive off the server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: /root/backups/qloapps-archive.sql.gz
+          target: ./archive/
+          strip_components: 2
+
+      - name: Keep it as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qloapps-final-archive
+          path: ./archive/qloapps-archive.sql.gz
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Remove the QloApps stack
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -e
+            docker rm -f citizen-lodge 2>/dev/null || true
+            docker volume rm citizen-lodge_qloapps-www citizen-lodge_qloapps-mysql 2>/dev/null || true
+            docker rmi webkul/qloapps_docker:latest 2>/dev/null || true
+            docker rmi ghcr.io/cymonmachera/citizen-lodge:latest 2>/dev/null || true
+            rm -rf /opt/citizen-lodge
+            docker system prune -f
+            echo "=== QloApps removed. Disk now: ==="
+            df -h / | awk 'NR==2{print $4" free of "$2}'
+            free -h | awk 'NR==2{print $7" RAM available"}'
