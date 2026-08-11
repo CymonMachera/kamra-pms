@@ -316,4 +316,5 @@ jobs:
             echo "${{ secrets.LODGE_SEED_B64 }}" | base64 -d > /tmp/seed_lodge.py
             docker compose cp /tmp/seed_lodge.py backend:/tmp/seed_lodge.py
             rm -f /tmp/seed_lodge.py
-            docker compose exec -T backend bash -c               "cp /tmp/seed_lodge.py apps/kamra/kamra/scripts/_seed_lodge.py &&                bench --site '$SITE' execute kamra.scripts._seed_lodge.execute;                rm -f apps/kamra/kamra/scripts/_seed_lodge.py /tmp/seed_lodge.py"
+            docker compose exec -T backend bash -c               "cp /tmp/seed_lodge.py apps/kamra/kamra/scripts/_seed_lodge.py &&                bench --site '$SITE' execute kamra.scripts._seed_lodge.execute;                rm -f apps/kamra/kamra/scripts/_seed_lodge.py || true"
+            docker compose exec -T --user root backend rm -f /tmp/seed_lodge.py || true
