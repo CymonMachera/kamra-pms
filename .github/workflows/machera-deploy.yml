@@ -1,0 +1,155 @@
+# Machera Group deployment for Citizen Lodge.
+# Lives on the `machera` branch of this fork. Contains NO credentials -
+# every secret is read from GitHub Secrets at run time.
+name: Deploy Citizen Lodge (Kamra)
+
+on:
+  push:
+    branches: [machera]
+  workflow_dispatch:
+    inputs:
+      cutover:
+        description: "Point citizen.machera.co.tz at Kamra and stop QloApps"
+        type: boolean
+        default: false
+      reset_site:
+        description: "DANGER: drop and recreate the site (destroys lodge data)"
+        type: boolean
+        default: false
+
+env:
+  IMAGE: ghcr.io/cymonmachera/kamra-lodge
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout frappe_docker (build tooling)
+        uses: actions/checkout@v4
+        with:
+          repository: frappe/frappe_docker
+          path: frappe_docker
+
+      - name: Compose apps.json
+        run: |
+          cat > apps.json <<'EOF'
+          [
+            { "url": "https://github.com/frappe/payments", "branch": "version-16" },
+            { "url": "https://github.com/CymonMachera/kamra-pms", "branch": "machera" }
+          ]
+          EOF
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: frappe_docker
+          file: frappe_docker/images/custom/Containerfile
+          push: true
+          build-args: |
+            FRAPPE_PATH=https://github.com/frappe/frappe
+            FRAPPE_BRANCH=version-16
+            CACHE_BUST=${{ github.sha }}
+          secret-files: |
+            apps_json=./apps.json
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ship compose + nginx config
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: deploy/compose.yaml,deploy/nginx-citizen.conf
+          target: /opt/citizen-lodge-kamra/
+          strip_components: 1
+
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 40m
+          script: |
+            set -e
+            SITE="${{ secrets.KAMRA_SITE }}"
+
+            # One-time safety net: keep a dated dump of the outgoing QloApps data
+            mkdir -p /root/backups
+            if docker ps --format '{{.Names}}' | grep -q '^citizen-lodge$'; then
+              STAMP=$(date +%F)
+              if [ ! -f "/root/backups/qloapps-final-$STAMP.sql.gz" ]; then
+                docker exec citizen-lodge mysqldump -uroot citizenlodge 2>/dev/null \
+                  | gzip > "/root/backups/qloapps-final-$STAMP.sql.gz" || true
+                echo "QloApps backup: $(ls -lh /root/backups/qloapps-final-$STAMP.sql.gz | awk '{print $5}')"
+              fi
+            fi
+
+            mkdir -p /opt/citizen-lodge-kamra && cd /opt/citizen-lodge-kamra
+            mv -f compose.yaml docker-compose.yml 2>/dev/null || true
+            cat > .env <<EOF
+            KAMRA_SITE=$SITE
+            DB_ROOT_PASSWORD=${{ secrets.KAMRA_DB_ROOT_PASSWORD }}
+            EOF
+            chmod 600 .env
+
+            echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u cymonmachera --password-stdin
+            docker compose pull
+            docker compose up -d
+            sleep 15
+
+            if [ "${{ inputs.reset_site }}" = "true" ]; then
+              docker compose exec -T backend bench drop-site "$SITE" \
+                --db-root-password "${{ secrets.KAMRA_DB_ROOT_PASSWORD }}" --force --no-backup || true
+            fi
+
+            # sites volume may carry an apps.txt from an older image
+            docker compose exec -T backend bash -c 'ls -1 apps > sites/apps.txt'
+
+            if ! docker compose exec -T backend test -d "sites/$SITE"; then
+              echo "First boot: creating $SITE"
+              docker compose exec -T backend bench new-site "$SITE" \
+                --mariadb-root-password "${{ secrets.KAMRA_DB_ROOT_PASSWORD }}" \
+                --admin-password "${{ secrets.KAMRA_ADMIN_PASSWORD }}" \
+                --install-app payments --install-app kamra \
+                --set-default --mariadb-user-host-login-scope='%'
+            fi
+
+            for APP in payments kamra; do
+              docker compose exec -T backend bash -c \
+                "bench --site '$SITE' list-apps | grep -q $APP || bench --site '$SITE' install-app $APP"
+            done
+            docker compose exec -T backend bench --site all migrate || true
+            docker compose exec -T backend bench --site "$SITE" set-config host_name "https://$SITE" || true
+
+            # Cutover: hand the public domain from QloApps to Kamra
+            if [ "${{ inputs.cutover }}" = "true" ]; then
+              echo "=== CUTOVER ==="
+              cp nginx-citizen.conf /etc/nginx/sites-available/citizen.conf
+              nginx -t && systemctl reload nginx
+              docker stop citizen-lodge || true
+              docker update --restart=no citizen-lodge || true
+              echo "QloApps stopped; citizen.machera.co.tz now serves Kamra."
+            fi
+
+            docker image prune -f
