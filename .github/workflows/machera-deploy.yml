@@ -17,6 +17,11 @@ on:
         type: boolean
         default: false
 
+# One deploy at a time - concurrent runs fight over container names on the server
+concurrency:
+  group: citizen-lodge-deploy
+  cancel-in-progress: false
+
 env:
   IMAGE: ghcr.io/cymonmachera/kamra-lodge
 
