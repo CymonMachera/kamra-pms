@@ -20,6 +20,10 @@ on:
         description: "Remove the retired QloApps stack (archives its DB first)"
         type: boolean
         default: false
+      tune_server:
+        description: "Add swap and report memory headroom (safe, idempotent)"
+        type: boolean
+        default: false
 
 # One deploy at a time - concurrent runs fight over container names on the server
 concurrency:
@@ -31,6 +35,7 @@ env:
 
 jobs:
   build:
+    if: ${{ !inputs.purge_qloapps && !inputs.tune_server }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -78,6 +83,7 @@ jobs:
 
   deploy:
     needs: build
+    if: ${{ !inputs.purge_qloapps && !inputs.tune_server }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,9 +178,39 @@ jobs:
 
             docker image prune -f
 
+  tune-server:
+    if: ${{ inputs.tune_server }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add swap and report headroom
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -e
+            if ! swapon --show | grep -q /swapfile; then
+              fallocate -l 8G /swapfile
+              chmod 600 /swapfile
+              mkswap /swapfile >/dev/null
+              swapon /swapfile
+              grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+              echo "8G swap created and persisted"
+            else
+              echo "swap already present"
+            fi
+            sysctl -w vm.swappiness=10 >/dev/null
+            grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
+            echo "=== memory ==="
+            free -h
+            echo "=== disk ==="
+            df -h / | awk 'NR==2{print $4" free of "$2}'
+            echo "=== heaviest containers ==="
+            docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' | sort -k2 -h -r | head -8
+
   purge-qloapps:
     if: ${{ inputs.purge_qloapps }}
-    needs: deploy
     runs-on: ubuntu-latest
     steps:
       - name: Verify the archive exists on the server
