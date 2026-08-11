@@ -222,12 +222,22 @@ jobs:
           script: |
             set -e
             mkdir -p /root/backups
-            # File-level archive of the raw volumes: needs no DB credentials and
-            # captures the database, uploaded images and config verbatim.
-            docker run --rm \
-              -v citizen-lodge_qloapps-mysql:/data/mysql:ro \
-              -v citizen-lodge_qloapps-www:/data/www:ro \
-              -v /root/backups:/backup \
+            # Drop any empty placeholder volumes a previous mistyped run created
+            for v in citizen-lodge_qloapps-mysql citizen-lodge_qloapps-www; do
+              docker volume rm "$v" 2>/dev/null || true
+            done
+            # Discover the real QloApps volumes rather than assuming their names
+            VOLS=$(docker volume ls -q | grep -E '^citizen-lodge' || true)
+            if [ -z "$VOLS" ]; then
+              echo "No citizen-lodge volumes on this host - nothing to archive or purge."
+              exit 1
+            fi
+            echo "volumes found:"; echo "$VOLS" | sed 's/^/  /'
+            MOUNTS=""
+            for v in $VOLS; do MOUNTS="$MOUNTS -v $v:/data/$v:ro"; done
+            # File-level archive: no DB credentials needed; captures database,
+            # uploaded images and config verbatim.
+            docker run --rm $MOUNTS -v /root/backups:/backup \
               alpine tar czf /backup/qloapps-archive.tar.gz -C /data .
             SIZE=$(stat -c%s /root/backups/qloapps-archive.tar.gz)
             echo "archive: /root/backups/qloapps-archive.tar.gz ($SIZE bytes)"
@@ -267,7 +277,9 @@ jobs:
           script: |
             set -e
             docker rm -f citizen-lodge 2>/dev/null || true
-            docker volume rm citizen-lodge_qloapps-www citizen-lodge_qloapps-mysql 2>/dev/null || true
+            for v in $(docker volume ls -q | grep -E '^citizen-lodge' || true); do
+              docker volume rm "$v" 2>/dev/null || true
+            done
             docker rmi webkul/qloapps_docker:latest 2>/dev/null || true
             docker rmi ghcr.io/cymonmachera/citizen-lodge:latest 2>/dev/null || true
             rm -rf /opt/citizen-lodge
