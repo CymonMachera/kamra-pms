@@ -1,0 +1,42 @@
+# Containerized development environment for Kamra PMS.
+#
+#   docker compose -p kamra-eval -f docker-compose.dev.yml up -d
+#
+# Then follow docs/dev-docker.md to create the bench and site.
+# Everything lives in named volumes, so this stack cannot touch any other
+# Frappe bench on the same machine.
+services:
+  mariadb:
+    image: docker.io/mariadb:11.8
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-123}
+      MARIADB_AUTO_UPGRADE: 1
+    volumes:
+      - kamra-mariadb:/var/lib/mysql
+
+  redis-cache:
+    image: docker.io/redis:alpine
+
+  redis-queue:
+    image: docker.io/redis:alpine
+
+  frappe:
+    image: docker.io/frappe/bench:latest
+    command: sleep infinity
+    environment:
+      - SHELL=/bin/bash
+    volumes:
+      - kamra-bench:/workspace
+    working_dir: /workspace
+    ports:
+      # host:container - 8100 keeps clear of a default bench on 8000
+      - "8100-8105:8000-8005"
+      - "9100-9105:9000-9005"
+
+volumes:
+  kamra-mariadb:
+  kamra-bench:
