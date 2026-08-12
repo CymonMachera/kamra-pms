@@ -518,6 +518,8 @@ def registration_card(reservation: str):
 			"booked_by_name": res.get("booked_by_name"),
 			"source": res.source, "eta": res.get("eta"),
 			"special_requests": res.special_requests,
+			"purpose": res.get("purpose"),
+			"coming_from": res.get("coming_from"),
 			"precheckin_status": res.get("precheckin_status"),
 		},
 		"guest": {
@@ -527,6 +529,9 @@ def registration_card(reservation: str):
 			"id_file": guest.get("id_file"),
 			"address_proof_file": guest.get("address_proof_file"),
 			"guest_id": guest.name,
+			"place_of_birth": guest.get("place_of_birth"),
+			"tribe": guest.get("tribe"),
+			"occupation": guest.get("occupation"),
 			"address": ", ".join(filter(None, [  # nosemgrep: frappe-no-functional-code -- filter(None, ...) drops empty address parts; equivalent to a comprehension
 				guest.get("address_line"), guest.get("city")])),
 		},
@@ -534,7 +539,9 @@ def registration_card(reservation: str):
 			{"row": o.name, "full_name": o.full_name, "age": o.age,
 			 "gender": o.gender, "nationality": o.nationality,
 			 "id_type": o.id_type, "id_number": o.id_number,
-			 "phone": o.phone, "id_file": o.get("id_file")}
+			 "phone": o.phone, "id_file": o.get("id_file"),
+			 "place_of_birth": o.get("place_of_birth"),
+			 "occupation": o.get("occupation")}
 			for o in (res.get("occupants") or [])
 		],
 	}
@@ -1135,10 +1142,12 @@ def update_occupants(reservation: str, occupants):
 			"full_name": o["full_name"].strip(),
 			"age": o.get("age") or None,
 			"gender": o.get("gender") or "",
-			"nationality": o.get("nationality") or "Indian",
+			"nationality": o.get("nationality") or "",
 			"id_type": o.get("id_type") or "",
 			"id_number": (o.get("id_number") or "").strip(),
 			"phone": o.get("phone") or "",
+			"place_of_birth": o.get("place_of_birth") or "",
+			"occupation": o.get("occupation") or "",
 			# an uploaded ID survives a register edit
 			"id_file": o.get("id_file")
 			           or existing_scans.get(o.get("row")) or None,
@@ -1149,7 +1158,9 @@ def update_occupants(reservation: str, occupants):
 	            {"row": o.name, "full_name": o.full_name, "age": o.age,
 	             "gender": o.gender, "nationality": o.nationality,
 	             "id_type": o.id_type, "id_number": o.id_number,
-	             "phone": o.phone, "id_file": o.get("id_file")}
+	             "phone": o.phone, "id_file": o.get("id_file"),
+	             "place_of_birth": o.get("place_of_birth"),
+	             "occupation": o.get("occupation")}
 	            for o in doc.occupants]}
 
 

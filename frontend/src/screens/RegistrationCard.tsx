@@ -19,6 +19,8 @@ interface Occupant {
   id_type: string | null
   id_number: string | null
   phone: string | null
+  place_of_birth?: string | null
+  occupation?: string | null
 }
 
 interface Grc {
@@ -48,6 +50,8 @@ interface Grc {
     booked_by_name: string | null
     source: string
     special_requests: string | null
+    purpose?: string | null
+    coming_from?: string | null
   }
   money?: {
     folio: string
@@ -69,6 +73,9 @@ interface Grc {
     address_proof_file?: string | null
     guest_id?: string
     address: string
+    place_of_birth?: string | null
+    tribe?: string | null
+    occupation?: string | null
   }
   occupants: Occupant[]
 }
@@ -86,7 +93,7 @@ function Row(props: { label: string; value?: string | null }) {
 }
 
 const emptyOccupant = (): Occupant => ({
-  full_name: "", age: null, gender: "", nationality: "Indian",
+  full_name: "", age: null, gender: "", nationality: "Tanzanian", place_of_birth: "", occupation: "",
   id_type: "", id_number: "", phone: "",
 })
 
@@ -166,13 +173,25 @@ function OccupantsEditor(props: {
               value={o.nationality ?? ""}
               onChange={(e) => set(i, { nationality: e.target.value })}
             />
+            <input
+              className={`${editInputCls} w-28`}
+              placeholder="Place of birth"
+              value={o.place_of_birth ?? ""}
+              onChange={(e) => set(i, { place_of_birth: e.target.value })}
+            />
+            <input
+              className={`${editInputCls} w-24`}
+              placeholder="Occupation"
+              value={o.occupation ?? ""}
+              onChange={(e) => set(i, { occupation: e.target.value })}
+            />
             <select
               className={editInputCls}
               value={o.id_type ?? ""}
               onChange={(e) => set(i, { id_type: e.target.value })}
             >
               <option value="">ID type</option>
-              {["Aadhaar", "PAN", "Passport", "Driving License", "Voter ID", "Other"].map(
+              {["National ID", "Passport", "Driving License", "Voter ID", "Other"].map(
                 (t) => (
                   <option key={t}>{t}</option>
                 ),
@@ -363,6 +382,10 @@ export default function RegistrationCard() {
             <Row label="Phone" value={d.guest.phone} />
             <Row label="Email" value={d.guest.email} />
             <Row label="Nationality" value={d.guest.nationality} />
+            <Row label="Place of Birth" value={d.guest.place_of_birth} />
+            <Row label="Tribe" value={d.guest.tribe} />
+            <Row label="Occupation" value={d.guest.occupation} />
+            <Row label="Arriving From" value={d.reservation.coming_from} />
             <Row label="ID" value={d.guest.id_type ? `${d.guest.id_type} · ${d.guest.id_number ?? ""}` : null} />
             <div className="mt-2 grid grid-cols-2 gap-3 print:grid-cols-2">
               {([["id", "ID document", d.guest.id_file],
@@ -443,6 +466,8 @@ export default function RegistrationCard() {
                 <th className="py-1 pr-3 font-medium">Age</th>
                 <th className="py-1 pr-3 font-medium">Gender</th>
                 <th className="py-1 pr-3 font-medium">Nationality</th>
+                <th className="py-1 pr-3 font-medium">Place of Birth</th>
+                <th className="py-1 pr-3 font-medium">Occupation</th>
                 <th className="py-1 font-medium">ID</th>
               </tr>
             </thead>
@@ -453,6 +478,8 @@ export default function RegistrationCard() {
                   <td className="py-1.5 pr-3">{o.age ?? "-"}</td>
                   <td className="py-1.5 pr-3">{o.gender || "-"}</td>
                   <td className="py-1.5 pr-3">{o.nationality || "-"}</td>
+                  <td className="py-1.5 pr-3">{o.place_of_birth || "-"}</td>
+                  <td className="py-1.5 pr-3">{o.occupation || "-"}</td>
                   <td className="py-1.5">
                     {o.id_type ? `${o.id_type} · ${o.id_number ?? ""}` : "-"}
                   </td>
