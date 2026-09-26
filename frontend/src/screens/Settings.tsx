@@ -7,7 +7,8 @@ import {
   updateResource,
 } from "../lib/resource"
 import { getTheme, setTheme, type Theme } from "../lib/theme"
-import { getLang, setLang, type Lang } from "../lib/dir"
+import { getLang, setLang, LANGS, type Lang } from "../lib/dir"
+import { useT } from "../lib/i18n"
 import { Button } from "../components/ui/button"
 import ImageField from "../components/ImageField"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -35,12 +36,13 @@ function Field(props: {
   value: unknown
   onChange: (v: unknown) => void
 }) {
+  const { t } = useT()
   const { spec, value, onChange } = props
   if (spec.type === "image")
     return (
       <ImageField
-        label={spec.label}
-        hint={spec.hint ?? ""}
+        label={t(spec.label)}
+        hint={spec.hint ? t(spec.hint) : ""}
         value={String(value ?? "")}
         onChange={onChange}
       />
@@ -54,14 +56,14 @@ function Field(props: {
           checked={Boolean(Number(value ?? 0))}
           onChange={(e) => onChange(e.target.checked ? 1 : 0)}
         />
-        {spec.label}
-        {spec.hint && <span className="text-xs text-zinc-400">{spec.hint}</span>}
+        {t(spec.label)}
+        {spec.hint && <span className="text-xs text-zinc-400">{t(spec.hint)}</span>}
       </label>
     )
   return (
     <label className="block">
       <span className="mb-1 block text-sm font-medium text-zinc-600">
-        {spec.label}
+        {t(spec.label)}
       </span>
       {spec.type === "select" ? (
         <select
@@ -71,7 +73,7 @@ function Field(props: {
         >
           {spec.options?.map((o) => (
             <option key={o} value={o}>
-              {o || "-"}
+              {o ? t(o) : "-"}
             </option>
           ))}
         </select>
@@ -85,7 +87,7 @@ function Field(props: {
         <input
           className={inputCls}
           type={spec.type ?? "text"}
-          placeholder={spec.type === "password" ? "unchanged" : undefined}
+          placeholder={spec.type === "password" ? t("unchanged") : undefined}
           value={
             spec.type === "password" ? String(value ?? "") : String(value ?? "")
           }
@@ -101,7 +103,7 @@ function Field(props: {
         />
       )}
       {spec.hint && (
-        <span className="mt-0.5 block text-xs text-zinc-400">{spec.hint}</span>
+        <span className="mt-0.5 block text-xs text-zinc-400">{t(spec.hint)}</span>
       )}
     </label>
   )
@@ -115,6 +117,7 @@ function SettingsCard(props: {
   onSave: (changes: Doc) => Promise<void>
   columns?: number
 }) {
+  const { t } = useT()
   const [draft, setDraft] = useState<Doc>({})
   const [busy, setBusy] = useState(false)
   const [state, setState] = useState<"idle" | "saved" | string>("idle")
@@ -139,9 +142,9 @@ function SettingsCard(props: {
     <Card>
       <CardHeader>
         <div>
-          <CardTitle>{props.title}</CardTitle>
+          <CardTitle>{t(props.title)}</CardTitle>
           {props.description && (
-            <p className="mt-0.5 text-xs text-zinc-400">{props.description}</p>
+            <p className="mt-0.5 text-xs text-zinc-400">{t(props.description)}</p>
           )}
         </div>
       </CardHeader>
@@ -168,10 +171,10 @@ function SettingsCard(props: {
             disabled={busy || Object.keys(draft).length === 0}
             onClick={save}
           >
-            {busy ? "Saving…" : "Save"}
+            {busy ? t("Saving…") : t("Save")}
           </Button>
           {state === "saved" && (
-            <span className="text-xs text-emerald-600">Saved</span>
+            <span className="text-xs text-emerald-600">{t("Saved")}</span>
           )}
           {state !== "idle" && state !== "saved" && (
             <span className="text-xs text-rose-600">{state}</span>
@@ -181,6 +184,24 @@ function SettingsCard(props: {
     </Card>
   )
 }
+
+const TIMEZONES = [
+  "Asia/Aden",
+  "Asia/Riyadh",
+  "Asia/Dubai",
+  "Asia/Muscat",
+  "Asia/Kolkata",
+  "Asia/Jakarta",
+  "Asia/Bangkok",
+  "Asia/Singapore",
+  "Europe/London",
+  "Europe/Paris",
+  "Africa/Cairo",
+  "Africa/Nairobi",
+  "America/New_York",
+  "America/Los_Angeles",
+  "UTC",
+]
 
 const PROPERTY_SPECS: Spec[] = [
   { field: "property_name", label: "Property name" },
@@ -196,6 +217,13 @@ const PROPERTY_SPECS: Spec[] = [
     label: "Country",
     hint: "Selects the tax & invoicing pack. India and Indonesia today; more via the Marketplace.",
   },
+  {
+    field: "timezone",
+    label: "Time zone",
+    type: "select",
+    options: TIMEZONES,
+    hint: "Hotel local clock — night audit and timestamps. Updates the site time zone too.",
+  },
   { field: "phone", label: "Phone" },
   { field: "email", label: "Email" },
   { field: "website", label: "Website" },
@@ -205,6 +233,15 @@ const PROPERTY_SPECS: Spec[] = [
   { field: "state", label: "State" },
   { field: "pincode", label: "PIN code" },
 ]
+
+/** Keep an unknown existing IANA zone visible in the picker. */
+function propertySpecsFor(doc: Doc): Spec[] {
+  const tz = String(doc.timezone || "").trim()
+  if (!tz || TIMEZONES.includes(tz)) return PROPERTY_SPECS
+  return PROPERTY_SPECS.map((s) =>
+    s.field === "timezone" ? { ...s, options: [tz, ...TIMEZONES] } : s,
+  )
+}
 
 const STAY_TAX_SPECS: Spec[] = [
   { field: "checkin_time", label: "Check-in time", type: "time" },
@@ -233,13 +270,24 @@ const STAY_TAX_SPECS: Spec[] = [
     label: "Guest ID retention",
     type: "select",
     options: ["Store", "Verify & Discard"],
-    hint: "Verify & Discard masks ID numbers to the last 4 digits at checkout",
+    hint: "Verify & Discard (recommended) masks ID numbers to the last 4 digits and deletes ID photos at checkout",
+  },
+  {
+    field: "guest_retention_months",
+    label: "Erase guest data after (months)",
+    type: "number",
+    hint: "guests with no stay for this long are erased automatically; bills stay for the books. 0 keeps them",
+  },
+  {
+    field: "privacy_contact",
+    label: "Privacy contact (Grievance Officer)",
+    hint: "email or phone guests use for access, correction or erasure requests; shown on booking and check-in pages",
   },
   {
     field: "require_cashier_pin",
     label: "Require cashier PIN on money actions",
     type: "check",
-    hint: "Payments, invoices, allowances and settlements re-confirm who is acting with a personal PIN - agents are exempt (the action log covers them)",
+    hint: "Payments, invoices, allowances and settlements re-confirm who is acting with a personal PIN - agents are exempt (the action log covers them). Admin can reset a user's PIN from the Cashier PIN Reset panel below.",
   },
 ]
 
@@ -247,6 +295,48 @@ const BOOKING_SPECS: Spec[] = [
   {
     field: "booking_engine_enabled",
     label: "Public booking page (/book)",
+    type: "check",
+  },
+  {
+    field: "booking_mode",
+    label: "Booking mode",
+    type: "select",
+    options: ["Instant", "Request to Book"],
+  },
+  {
+    field: "hold_minutes",
+    label: "Hold window (minutes)",
+    type: "number",
+  },
+  {
+    field: "minimum_nights",
+    label: "Minimum stay nights",
+    type: "number",
+  },
+  {
+    field: "cleaning_fee",
+    label: "Cleaning fee",
+    type: "number",
+  },
+  {
+    field: "cleaning_fee_taxable",
+    label: "Cleaning fee taxable",
+    type: "check",
+  },
+  {
+    field: "security_deposit_amount",
+    label: "Security deposit amount",
+    type: "number",
+  },
+  {
+    field: "access_instructions",
+    label: "Access instructions",
+    type: "textarea",
+    hint: "Released to guests only after payment, deposit, and optional pre-check-in gates",
+  },
+  {
+    field: "require_precheckin_for_access",
+    label: "Require pre-check-in for access",
     type: "check",
   },
   {
@@ -306,23 +396,6 @@ const POLICY_SPECS: Spec[] = [
   },
 ]
 
-const AI_SPECS: Spec[] = [
-  { field: "enabled", label: "Enabled", type: "check" },
-  {
-    field: "base_url",
-    label: "Provider base URL",
-    hint: "any OpenAI-compatible endpoint: OpenAI, OpenRouter, Groq, Ollama…",
-  },
-  { field: "model", label: "Model" },
-  { field: "api_key", label: "API key", type: "password" },
-  {
-    field: "extra_instructions",
-    label: "Extra instructions",
-    type: "textarea",
-    hint: "property-specific guidance - upsell priorities, tone",
-  },
-]
-
 const GATEWAY_SPECS: Spec[] = [
   { field: "enabled", label: "Enabled", type: "check" },
   {
@@ -343,7 +416,331 @@ const GATEWAY_SPECS: Spec[] = [
   { field: "webhook_secret", label: "Webhook secret", type: "password" },
 ]
 
+function CashierPinResetCard() {
+  const [user, setUser] = useState("")
+  const [msg, setMsg] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>Cashier PIN reset</CardTitle>
+          <p className="mt-0.5 text-xs text-zinc-400">
+            Hotel Admin can wipe a user&apos;s PIN so they re-enroll on the next
+            money action. Use when someone forgets their PIN.
+          </p>
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-wrap items-end gap-2">
+        <label className="block text-sm">
+          <span className="mb-1 block text-zinc-600">User (email / id)</span>
+          <input
+            className={inputCls + " w-64"}
+            value={user}
+            onChange={(e) => setUser(e.target.value)}
+            placeholder="front.desk@hotel.com"
+          />
+        </label>
+        <Button
+          variant="outline"
+          disabled={busy || !user.trim()}
+          onClick={async () => {
+            setBusy(true)
+            setErr(null)
+            setMsg(null)
+            try {
+              await call("kamra.api.reset_cashier_pin", { user: user.trim() })
+              setMsg(`PIN reset for ${user.trim()} — they must set a new one.`)
+              setUser("")
+            } catch (e) {
+              setErr(serverError(e))
+            } finally {
+              setBusy(false)
+            }
+          }}
+        >
+          Reset PIN
+        </Button>
+        {msg ? <p className="w-full text-sm text-emerald-700">{msg}</p> : null}
+        {err ? <p className="w-full text-sm text-rose-600">{err}</p> : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+type AiPreset = {
+  id: string
+  label: string
+  base_url: string
+  model: string
+  hint: string
+}
+
+function AiAssistantCard({
+  property,
+  doc,
+  onSaved,
+}: {
+  property: string
+  doc: Doc
+  onSaved: () => void
+}) {
+  const { t } = useT()
+  const [presets, setPresets] = useState<AiPreset[]>([])
+  const [provider, setProvider] = useState("openai")
+  const [enabled, setEnabled] = useState(Boolean(Number(doc.enabled ?? 0)))
+  const [baseUrl, setBaseUrl] = useState(String(doc.base_url ?? "https://api.openai.com/v1"))
+  const [model, setModel] = useState(String(doc.model ?? "gpt-4o-mini"))
+  const [apiKey, setApiKey] = useState("")
+  const [extra, setExtra] = useState(String(doc.extra_instructions ?? ""))
+  const [busy, setBusy] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [state, setState] = useState<"idle" | "saved" | string>("idle")
+  const [testMsg, setTestMsg] = useState<string | null>(null)
+
+  useEffect(() => {
+    call<{ presets: AiPreset[] }>("kamra.assistant.provider_presets")
+      .then((r) => setPresets(r.presets || []))
+      .catch(() =>
+        setPresets([
+          {
+            id: "openai",
+            label: "OpenAI",
+            base_url: "https://api.openai.com/v1",
+            model: "gpt-4o-mini",
+            hint: "Paste an sk-… key",
+          },
+        ]),
+      )
+  }, [])
+
+  useEffect(() => {
+    setEnabled(Boolean(Number(doc.enabled ?? 0)))
+    setBaseUrl(String(doc.base_url ?? "https://api.openai.com/v1"))
+    setModel(String(doc.model ?? "gpt-4o-mini"))
+    setExtra(String(doc.extra_instructions ?? ""))
+    setApiKey("")
+  }, [doc])
+
+  const activeHint =
+    presets.find((p) => p.id === provider)?.hint ||
+    "Any OpenAI-compatible Chat Completions host"
+
+  function applyPreset(id: string) {
+    setProvider(id)
+    const p = presets.find((x) => x.id === id)
+    if (!p) return
+    if (p.base_url) setBaseUrl(p.base_url)
+    if (p.model) setModel(p.model)
+    setState("idle")
+    setTestMsg(null)
+  }
+
+  async function save() {
+    setBusy(true)
+    setState("idle")
+    try {
+      const payload: Doc = {
+        enabled: enabled ? 1 : 0,
+        base_url: baseUrl,
+        model,
+        extra_instructions: extra,
+      }
+      if (apiKey) payload.api_key = apiKey
+      if (doc.name) {
+        await updateResource("AI Assistant Settings", String(doc.name), payload)
+      } else {
+        await createResource("AI Assistant Settings", { ...payload, property })
+      }
+      setApiKey("")
+      setState("saved")
+      onSaved()
+    } catch (e) {
+      setState(serverError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function test() {
+    setTesting(true)
+    setTestMsg(null)
+    try {
+      const r = await call<{
+        ok: boolean
+        error?: string
+        reply?: string
+        latency_ms?: number
+        status?: number
+      }>("kamra.assistant.test_connection", {
+        property,
+        base_url: baseUrl,
+        model,
+        api_key: apiKey || undefined,
+      })
+      if (r.ok) {
+        setTestMsg(
+          t("Connected ({ms} ms) — {reply}", {
+            ms: r.latency_ms ?? "?",
+            reply: (r.reply || "ok").slice(0, 80),
+          }),
+        )
+      } else {
+        setTestMsg(
+          t("Failed{status}: {err}", {
+            status: r.status ? ` (${r.status})` : "",
+            err: r.error || "unknown error",
+          }),
+        )
+      }
+    } catch (e) {
+      setTestMsg(serverError(e))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <CardTitle>{t("AI assistant (bring your own key)")}</CardTitle>
+          <p className="mt-0.5 text-xs text-zinc-400">
+            {t(
+              "Kamra Agent for staff. Pick a provider, paste the key, Test. Claude Desktop is MCP (Kamra Agent → Connect your AI) — not an Anthropic key in this form.",
+            )}
+          </p>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <label className="flex items-center gap-2 py-1 text-sm text-zinc-700">
+          <input
+            type="checkbox"
+            className="size-4 accent-brand-600"
+            checked={enabled}
+            onChange={(e) => {
+              setEnabled(e.target.checked)
+              setState("idle")
+            }}
+          />
+          {t("Enabled")}
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-zinc-600">
+            {t("Provider")}
+          </span>
+          <select
+            className={inputCls}
+            value={provider}
+            onChange={(e) => applyPreset(e.target.value)}
+          >
+            {presets.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          <span className="mt-0.5 block text-xs text-zinc-400">{activeHint}</span>
+        </label>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block">
+            <span className="mb-1 block text-sm font-medium text-zinc-600">
+              {t("Base URL")}
+            </span>
+            <input
+              className={inputCls}
+              value={baseUrl}
+              onChange={(e) => {
+                setBaseUrl(e.target.value)
+                setState("idle")
+              }}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-sm font-medium text-zinc-600">
+              {t("Model")}
+            </span>
+            <input
+              className={inputCls}
+              value={model}
+              onChange={(e) => {
+                setModel(e.target.value)
+                setState("idle")
+              }}
+            />
+          </label>
+        </div>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-zinc-600">
+            {t("API key")}
+          </span>
+          <input
+            className={inputCls}
+            type="password"
+            placeholder={t("unchanged")}
+            value={apiKey}
+            onChange={(e) => {
+              setApiKey(e.target.value)
+              setState("idle")
+            }}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-zinc-600">
+            {t("Extra instructions")}
+          </span>
+          <textarea
+            className={`${inputCls} min-h-20`}
+            value={extra}
+            onChange={(e) => {
+              setExtra(e.target.value)
+              setState("idle")
+            }}
+          />
+          <span className="mt-0.5 block text-xs text-zinc-400">
+            {t("property-specific guidance - upsell priorities, tone")}
+          </span>
+        </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button disabled={busy} onClick={save}>
+            {busy ? t("Saving…") : t("Save")}
+          </Button>
+          <Button variant="outline" disabled={testing} onClick={test}>
+            {testing ? t("Testing…") : t("Test connection")}
+          </Button>
+          {state === "saved" && (
+            <span className="text-xs text-emerald-600">{t("Saved")}</span>
+          )}
+          {state !== "idle" && state !== "saved" && (
+            <span className="text-xs text-rose-600">{state}</span>
+          )}
+        </div>
+        {testMsg && (
+          <p
+            className={
+              testMsg.startsWith("Connected") || testMsg.includes("Connected")
+                ? "text-sm text-emerald-700"
+                : "text-sm text-rose-600"
+            }
+          >
+            {testMsg}
+          </p>
+        )}
+        <p className="text-xs text-zinc-400">
+          {t("Want Claude the app?")}{" "}
+          <a href="/kamra/assistant" className="font-medium text-brand-700 hover:underline">
+            {t("Kamra Agent → Connect your AI")}
+          </a>
+          . {t("Want Claude the model in this chat? Use the OpenRouter preset.")}
+        </p>
+      </CardContent>
+    </Card>
+  )
+}
+
 export default function Settings() {
+  const { t } = useT()
   const property = getCurrentProperty()
   const [prop, setProp] = useState<Doc | null>(null)
   const [gateway, setGateway] = useState<Doc | null>(null)
@@ -355,7 +752,22 @@ export default function Settings() {
     call<Doc>("frappe.client.get", {
       doctype: "Property",
       name: property,
-    }).then(setProp)
+    }).then(async (p) => {
+      // Desk System Settings holds the site clock; surface it when Property
+      // timezone was never filled (common on older tenants).
+      if (!(p.timezone as string | undefined)?.trim()) {
+        try {
+          const ss = await call<Doc>("frappe.client.get", {
+            doctype: "System Settings",
+          })
+          const siteTz = String(ss.time_zone || "").trim()
+          if (siteTz) p = { ...p, timezone: siteTz }
+        } catch {
+          /* leave blank — user can pick */
+        }
+      }
+      setProp(p)
+    })
     listResource("Payment Gateway Settings", {
       fields: ["name", "gateway", "enabled", "test_mode", "key_id"],
       filters: [["property", "=", property]],
@@ -369,14 +781,14 @@ export default function Settings() {
   useEffect(load, [load])
 
   if (!prop || !gateway || !ai)
-    return <p className="py-10 text-center text-zinc-400">Loading…</p>
+    return <p className="py-10 text-center text-zinc-400">{t("Loading…")}</p>
 
   return (
     <div className="space-y-4">
       <SettingsCard
         title="Property"
         description="Identity and contact details - printed on invoices and the GRC."
-        specs={PROPERTY_SPECS}
+        specs={propertySpecsFor(prop)}
         doc={prop}
         onSave={async (changes) => {
           await updateResource("Property", property, changes)
@@ -393,6 +805,7 @@ export default function Settings() {
           load()
         }}
       />
+      <CashierPinResetCard />
       <SettingsCard
         title="Booking page"
         description="What guests see on the public booking engine."
@@ -442,28 +855,7 @@ export default function Settings() {
         }}
       />
 
-      <SettingsCard
-        title="AI assistant (bring your own key)"
-        description="Kamra Agent, the in-app assistant for staff. Your key, your data - the model can only act through Kamra's governed tools, and every action is audit-logged."
-        specs={AI_SPECS}
-        doc={ai}
-        onSave={async (changes) => {
-          const payload = Object.fromEntries(
-            Object.entries(changes).filter(
-              ([k, v]) => k !== "api_key" || v !== "",
-            ),
-          )
-          if (ai.name) {
-            await updateResource("AI Assistant Settings", String(ai.name), payload)
-          } else {
-            await createResource("AI Assistant Settings", {
-              ...payload,
-              property,
-            })
-          }
-          load()
-        }}
-      />
+      <AiAssistantCard property={property} doc={ai} onSaved={load} />
 
       <SettingsCard
         title="Revenue controls"
@@ -490,70 +882,64 @@ export default function Settings() {
           <div>
             <CardTitle>Agent access (MCP)</CardTitle>
             <p className="mt-0.5 text-xs text-zinc-400">
-              Connect Claude (or any MCP client) to this property's governed
-              tool layer. Every agent action lands in the Agent Action Log.
+              Connect Claude to this property's governed tool layer. Staff
+              click Connect Claude on Kamra Agent — no API keys on a laptop.
+              Every agent action lands in the Agent Action Log.
             </p>
           </div>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
           <p className="text-zinc-600">
-            The MCP server ships with the app at{" "}
-            <code className="rounded bg-zinc-100 px-1 py-0.5 text-xs">
-              apps/kamra/mcp/kamra_mcp.py
-            </code>
-            . It authenticates as the scoped{" "}
-            <code className="rounded bg-zinc-100 px-1 py-0.5 text-xs">
-              agent@kamra.local
-            </code>{" "}
-            user (Kamra Agent role). Generate an API key &amp; secret - and see
-            the full REST reference - on the{" "}
+            Open{" "}
+            <a href="/kamra/assistant" className="font-medium text-brand-700 hover:underline">
+              Kamra Agent → Connect your AI
+            </a>{" "}
+            and click <strong>Connect Claude</strong>. Claude opens with this
+            hotel&apos;s MCP URL filled in; confirm, sign in as yourself, done.
+            Service keys for unattended agents stay on{" "}
             <a href="/kamra/developers" className="font-medium text-brand-700 hover:underline">
               Developers
-            </a>{" "}
-            page.
+            </a>
+            .
           </p>
           <pre className="overflow-x-auto rounded-lg bg-zinc-100 p-3 text-xs leading-relaxed text-zinc-700">
-            {`claude mcp add kamra \\
-  -e KAMRA_URL=${window.location.origin} \\
-  -e KAMRA_API_KEY=<api key> \\
-  -e KAMRA_API_SECRET=<api secret> \\
-  -e KAMRA_PROPERTY="${property}" \\
-  -- python apps/kamra/mcp/kamra_mcp.py`}
+            {`claude mcp add --transport http kamra ${window.location.origin}/mcp`}
           </pre>
           <p className="text-xs text-zinc-400">
             Tools include availability, quotes, bookings, check-in/out, folio
             posting (billing-rule routed), occupant register, rate changes
-            (guardrail-bound), night audit and the owner briefing.
+            (guardrail-bound), night audit, owner briefing and banquets —
+            filtered to the signed-in user's roles.
           </p>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Appearance</CardTitle>
+          <CardTitle>{t("Appearance")}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex items-center gap-3">
-            <span className="w-20 text-sm font-medium text-zinc-600">Theme</span>
+            <span className="w-20 text-sm font-medium text-zinc-600">{t("Theme")}</span>
             <select
               className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm focus:outline-2 focus:outline-offset-1 focus:outline-brand-600"
               value={theme}
               onChange={(e) => {
-                const t = e.target.value as Theme
-                setTheme(t)
-                setThemeState(t)
+                const next = e.target.value as Theme
+                setTheme(next)
+                setThemeState(next)
               }}
             >
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-              <option value="system">System</option>
+              <option value="light">{t("Light")}</option>
+              <option value="dark">{t("Dark")}</option>
+              <option value="system">{t("System")}</option>
             </select>
             <span className="text-xs text-zinc-400">
-              applies to this browser only
+              {t("applies to this browser only")}
             </span>
           </div>
           <div className="flex items-center gap-3">
-            <span className="w-20 text-sm font-medium text-zinc-600">Language</span>
+            <span className="w-20 text-sm font-medium text-zinc-600">{t("Language")}</span>
             <select
               className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm focus:outline-2 focus:outline-offset-1 focus:outline-brand-600"
               value={lang}
@@ -563,11 +949,15 @@ export default function Settings() {
                 setLangState(l)
               }}
             >
-              <option value="en">English</option>
-              <option value="ar">العربية (Arabic)</option>
+              {LANGS.map((l) => (
+                <option key={l.code} value={l.code}>
+                  {l.nativeLabel}
+                  {l.code !== "en" ? ` (${l.englishLabel})` : ""}
+                </option>
+              ))}
             </select>
             <span className="text-xs text-zinc-400">
-              Arabic switches the interface to right-to-left · this browser only
+              {t("Arabic switches the interface to right-to-left · this browser only")}
             </span>
           </div>
         </CardContent>

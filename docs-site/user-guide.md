@@ -24,7 +24,9 @@ board, refreshed every 30 seconds.
 1. Type the guest's name — returning guests appear as you type; picking
    one attaches the stay to their profile ("Returning guest · 4 stays").
 2. Pick room type, dates, occupancy, meal plan. The **quote updates live**
-   and states the cancellation policy and any deposit expected.
+   and states the cancellation policy and any deposit expected. Check-in
+   cannot be before today (unless recording a past stay via import or an
+   explicit catch-up flag).
 3. **Add another room** turns the booking into a group — one confirm
    books every room under one group reference.
 4. Optional: company (bills corporate — see billing rules), travel
@@ -53,7 +55,9 @@ both re-priced and overlap-checked).
 **On the GRC**: record the **occupants** (everyone in the room — the
 legal register) and capture **each occupant's ID** with the camera
 button on their row; capture or replace the guest's ID and address
-proof; correct the **actual check-in/out times** when reality differs
+proof; **edit the primary guest's nationality** (click **edit** next to
+Nationality — updates the guest profile for the folio and printed
+invoice); correct the **actual check-in/out times** when reality differs
 from plan; and manage the stay's money line — advances, security
 deposits, refunds (reason required, capped at what was collected).
 Under Verify & Discard retention, every scan and full ID number is
@@ -66,6 +70,8 @@ that charges route to automatically (set per company under Corporate →
 billing rules; alcohol always bills to the guest).
 
 - **Post a charge** or **record a payment** from the folio screen.
+- **Nationality** on the folio header is editable (**edit** → Save) and
+  updates the guest profile for the printed bill.
 - **Split** any line by percent or amount (`30%` or `1500`) to another
   folio; select several lines to **move them in bulk**.
 - **Payment link** creates a gateway link for the balance and copies it.
@@ -112,5 +118,5 @@ from in-house guests also raise a ticket on **Guest Requests**.
   double for the weekend", "cancel RES-2026-0142, guest request" — it
   quotes before booking, previews before cancelling, and every action
   it takes is logged.
-- **MCP** connects Claude or any MCP client to the same tools — see
-  [AI & API setup](/ai-and-mcp).
+- **MCP** — **Kamra Agent → Connect your AI → Connect Claude**. It acts
+  as you. See [Connect your AI](/ai-and-mcp).

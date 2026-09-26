@@ -83,12 +83,20 @@ export function isAuthError(err: unknown): boolean {
   return status === 401 || status === 403
 }
 
-/** Upload an image to Frappe's public files; resolves to its served URL. */
-export async function uploadFile(file: File): Promise<string> {
+/** Upload an image to Frappe's public files; resolves to its served URL.
+ *  Pass doctype/docname/fieldname so Attach Image fields keep a real File
+ *  link — otherwise the URL shows in the form but is easy to lose on save. */
+export async function uploadFile(
+  file: File,
+  opts?: { doctype?: string; docname?: string; fieldname?: string },
+): Promise<string> {
   const token = csrfToken()
   const fd = new FormData()
   fd.append("file", file, file.name)
   fd.append("is_private", "0")
+  if (opts?.doctype) fd.append("doctype", opts.doctype)
+  if (opts?.docname) fd.append("docname", opts.docname)
+  if (opts?.fieldname) fd.append("fieldname", opts.fieldname)
   const res = await fetch("/api/method/upload_file", {
     method: "POST",
     // no Content-Type header: the browser sets the multipart boundary
@@ -96,11 +104,50 @@ export async function uploadFile(file: File): Promise<string> {
     body: fd,
     credentials: "include",
   })
-  if (!res.ok) throw new Error(`upload failed (${res.status})`)
+  if (!res.ok) {
+    let detail = `upload failed (${res.status})`
+    try {
+      const body = await res.json()
+      const msgs = JSON.parse(body._server_messages ?? "[]")
+      if (msgs.length) {
+        detail = String(JSON.parse(msgs[0]).message).replace(/<[^>]+>/g, "")
+      }
+    } catch {
+      /* keep status text */
+    }
+    throw new Error(detail)
+  }
   const out = (await res.json()) as { message?: { file_url?: string } }
   const url = out.message?.file_url
   if (!url) throw new Error("upload returned no file URL")
   return url
+}
+
+/** Upload a file to a custom Kamra endpoint (multipart), returning its result.
+ *  Unlike uploadFile (Frappe's built-in upload_file, which authorises against
+ *  the target doctype's own perms), this posts to a @require_roles endpoint that
+ *  handles the File itself — the pattern the rest of Kamra uses. */
+export async function uploadTo(
+  method: string,
+  file: File,
+  fields: Record<string, string> = {},
+): Promise<{ file_url: string; file_name: string }> {
+  const token = csrfToken()
+  const fd = new FormData()
+  fd.append("file", file, file.name)
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v)
+  const res = await fetch(`/api/method/${method}`, {
+    method: "POST",
+    headers: token ? { "X-Frappe-CSRF-Token": token } : undefined,
+    body: fd,
+    credentials: "include",
+  })
+  if (!res.ok) throw new Error(`upload failed (${res.status})`)
+  const out = (await res.json()) as {
+    message?: { file_url?: string; file_name?: string }
+  }
+  if (!out.message?.file_url) throw new Error("upload returned no file URL")
+  return out.message as { file_url: string; file_name: string }
 }
 
 export async function frappeFetch<T = unknown>(
@@ -236,6 +283,7 @@ export interface BookingOptions {
     cancellation_fee: "None" | "First Night" | "Full Stay"
     no_show_charge: "None" | "First Night" | "Full Stay"
     deposit_pct: number
+    country: string
   }
 }
 
@@ -252,6 +300,12 @@ export interface Quote {
 }
 
 export const DEMO_PROPERTY = "Kamra Demo Palace"
+
+// Every Kamra site hosts exactly one Property. The public booking engine
+// (/book) has no logged-in session to read a chosen property from, so it
+// asks the site which one to show instead of assuming the demo property.
+export const getDefaultProperty = () =>
+  call<string>("kamra.public_api.default_property")
 
 // Active property - set by the header switcher, read at call time.
 let currentProperty =
@@ -537,6 +591,10 @@ export interface FunctionSheet {
   customer_name: string
   customer_phone: string | null
   customer_email: string | null
+  customer_confirmed_on: string | null
+  customer_confirm_channel: string | null
+  customer_confirm_outcome: string | null
+  customer_confirm_notes: string | null
   company: string | null
   travel_agent: string | null
   billing_name: string | null
@@ -583,6 +641,7 @@ export interface FunctionSheet {
   closed_out_by: string | null
   quote_version: number
   quote_sent_on: string | null
+  quote_emailed_on: string | null
   quote_valid_till: string | null
   beo_number: string | null
   beo_generated_on: string | null
@@ -1312,6 +1371,58 @@ export const banquet = {
       valid_days: validDays,
       note: note ?? null,
     }),
+  sendQuotation: (fn: string, channels: string[] = ["email"]) =>
+    call<{
+      ok: boolean
+      sent: string[]
+      quote_emailed_on: string
+      quote_version: number
+    }>("kamra.banquet_ops.send_quotation", {
+      function: fn,
+      channels,
+    }),
+  recordGuestResponse: (
+    fn: string,
+    outcome: "Confirmed" | "Changes Requested" | "Declined",
+    opts?: { channel?: string; notes?: string; confirmStatus?: boolean },
+  ) =>
+    call<{
+      ok: boolean
+      customer_confirmed_on: string
+      customer_confirm_outcome: string
+      customer_confirm_channel: string
+      status: { ok: boolean; status: string } | null
+    }>("kamra.banquet_ops.record_guest_response", {
+      function: fn,
+      outcome,
+      channel: opts?.channel ?? "Phone",
+      notes: opts?.notes ?? null,
+      confirm_status: opts?.confirmStatus ? 1 : 0,
+    }),
+  functionTasks: (fn: string) =>
+    call<{
+      function: string
+      open: number
+      done: number
+      total: number
+      departments: {
+        department: string
+        tasks: {
+          name: string
+          department: string
+          title: string
+          due_date: string | null
+          status: string
+          completed_on: string | null
+          completed_by: string | null
+        }[]
+      }[]
+    }>("kamra.banquet_ops.function_tasks", { function: fn }),
+  completeFunctionTask: (task: string, done = true) =>
+    call<{ ok: boolean; name: string; status: string }>(
+      "kamra.banquet_ops.complete_function_task",
+      { task, done: done ? 1 : 0 },
+    ),
   generateBeo: (fn: string) =>
     call<BanquetDocument>("kamra.banquet.generate_beo", { function: fn }),
   generateInvoice: (fn: string) =>

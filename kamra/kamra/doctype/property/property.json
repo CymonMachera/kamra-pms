@@ -28,7 +28,13 @@
   "checkin_time",
   "checkout_time",
   "minimum_nights",
+  "booking_mode",
+  "hold_minutes",
   "security_deposit_amount",
+  "cleaning_fee",
+  "cleaning_fee_taxable",
+  "access_instructions",
+  "require_precheckin_for_access",
   "hourly_view_start",
   "hourly_view_end",
   "auto_send_checkin_links",
@@ -50,6 +56,7 @@
   "advance_percent",
   "registration_fee",
   "require_cashier_pin",
+  "business_date",
   "showcase_description",
   "hero_image",
   "star_category",
@@ -59,6 +66,8 @@
   "logo_url",
   "brand_accent",
   "id_retention",
+  "guest_retention_months",
+  "privacy_contact",
   "sell_message",
   "free_cancel_days",
   "cancellation_fee",
@@ -198,10 +207,52 @@
    "label": "Minimum Stay Nights"
   },
   {
+   "default": "Instant",
+   "description": "Instant: guest books into Pending Payment or Confirmed. Request to Book: guest waits for host approval (Requested). ADR-006.",
+   "fieldname": "booking_mode",
+   "fieldtype": "Select",
+   "in_standard_filter": 1,
+   "label": "Booking Mode",
+   "options": "Instant\nRequest to Book"
+  },
+  {
+   "default": "120",
+   "description": "Minutes a Held / Pending Payment reservation keeps inventory before auto-cancel.",
+   "fieldname": "hold_minutes",
+   "fieldtype": "Int",
+   "label": "Hold Window (minutes)"
+  },
+  {
    "default": "5000",
    "fieldname": "security_deposit_amount",
    "fieldtype": "Currency",
    "label": "Security Deposit Amount"
+  },
+  {
+   "default": "0",
+   "description": "One-time cleaning fee added to every quote (ADR-008). 0 = none.",
+   "fieldname": "cleaning_fee",
+   "fieldtype": "Currency",
+   "label": "Cleaning Fee"
+  },
+  {
+   "default": "1",
+   "description": "When checked, cleaning fee is taxed at the room GST rate.",
+   "fieldname": "cleaning_fee_taxable",
+   "fieldtype": "Check",
+   "label": "Cleaning Fee Taxable"
+  },
+  {
+   "description": "Released to the guest only after payment, deposit, and optional pre-check-in gates pass.",
+   "fieldname": "access_instructions",
+   "fieldtype": "Text",
+   "label": "Access Instructions"
+  },
+  {
+   "default": "0",
+   "fieldname": "require_precheckin_for_access",
+   "fieldtype": "Check",
+   "label": "Require Pre-check-in for Access"
   },
   {
    "default": "06:00:00",
@@ -213,8 +264,7 @@
    "default": "23:00:00",
    "fieldname": "hourly_view_end",
    "fieldtype": "Time",
-   "label": "Hourly View End",
-   "default": "23:00:00"
+   "label": "Hourly View End"
   },
   {
    "fieldname": "auto_send_checkin_links",
@@ -260,7 +310,7 @@
    "default": "7500",
    "fieldname": "gst_slab_threshold",
    "fieldtype": "Currency",
-   "label": "Slab Threshold (₹/night)"
+   "label": "Slab Threshold (\u20b9/night)"
   },
   {
    "default": "5",
@@ -332,6 +382,12 @@
    "default": "0"
   },
   {
+   "fieldname": "business_date",
+   "fieldtype": "Date",
+   "label": "Business Date",
+   "description": "Current front-office business date. Advanced by night audit."
+  },
+  {
    "fieldname": "showcase_description",
    "fieldtype": "Small Text",
    "label": "Description (public)"
@@ -340,7 +396,7 @@
    "fieldname": "hero_image",
    "fieldtype": "Attach Image",
    "label": "Hero Image",
-   "description": "1920×1080px (16:9 landscape), JPG or WebP under 2 MB. The big photo at the top of the booking page."
+   "description": "1920\u00d71080px (16:9 landscape), JPG or WebP under 2 MB. The big photo at the top of the booking page."
   },
   {
    "fieldname": "star_category",
@@ -365,7 +421,7 @@
    "label": "Property Amenities (public)"
   },
   {
-   "description": "Square, 512×512px. PNG or SVG with a transparent background. Shown on the booking page and invoices.",
+   "description": "Square, 512\u00d7512px. PNG or SVG with a transparent background. Shown on the booking page and invoices.",
    "fieldname": "logo_url",
    "fieldtype": "Attach Image",
    "label": "Logo"
@@ -378,12 +434,26 @@
    "label": "Booking Page Accent"
   },
   {
-   "default": "Store",
-   "description": "Verify & Discard masks occupant/guest ID numbers to the last 4 digits at checkout.",
+   "default": "Verify & Discard",
+   "description": "Verify & Discard (recommended, DPDP data minimisation) masks ID numbers to the last 4 digits and deletes ID photos at checkout. Store keeps them.",
    "fieldname": "id_retention",
    "fieldtype": "Select",
    "label": "ID Retention",
    "options": "Store\nVerify & Discard"
+  },
+  {
+   "fieldname": "guest_retention_months",
+   "fieldtype": "Int",
+   "label": "Erase guest data after (months)",
+   "default": "36",
+   "non_negative": 1,
+   "description": "Guests with no stay for this long are erased automatically (bills stay for the books). 0 keeps them indefinitely. Blacklisted guests are kept."
+  },
+  {
+   "fieldname": "privacy_contact",
+   "fieldtype": "Data",
+   "label": "Privacy contact (Grievance Officer)",
+   "description": "Email or phone that guests can use for access, correction and erasure requests. Shown on the booking and check-in pages."
   },
   {
    "description": "Shown to staff in the booking dialog and read by the AI agent as its upsell prompt.",
@@ -480,7 +550,7 @@
    "fieldname": "og_image",
    "fieldtype": "Attach Image",
    "label": "OG Image",
-   "description": "Exactly 1200×630px, JPG or PNG. What WhatsApp, Google and social previews show when the booking page is shared."
+   "description": "Exactly 1200\u00d7630px, JPG or PNG. What WhatsApp, Google and social previews show when the booking page is shared."
   },
   {
    "fieldname": "page_slug",
@@ -497,7 +567,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-01 09:00:00.000000",
+ "modified": "2026-09-24 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "Kamra",
  "name": "Property",

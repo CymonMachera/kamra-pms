@@ -130,7 +130,8 @@ def collect():
     modules = []
     for mod, folder, note in MODULES:
         path = os.path.join(APP, f"{mod}.py")
-        tree = ast.parse(open(path).read())  # nosemgrep: frappe-security-file-traversal -- path is derived from the app source tree, not from user input
+        with open(path) as src:  # nosemgrep: frappe-security-file-traversal -- path is derived from the app source tree, not from user input
+            tree = ast.parse(src.read())
         eps = []
         for node in tree.body:
             if not isinstance(node, ast.FunctionDef):
@@ -179,7 +180,7 @@ Authorization: token <api_key>:<api_secret>
 Content-Type: application/json
 ```
 
-- Get keys from **Copilot → Connect** (per-user, role-scoped) or the
+- Get keys from **Kamra Agent → Connect your AI** (Claude OAuth, role-scoped) or the
   dedicated agent user for services.
 - Responses: `{{"message": <return value>}}`. Errors are HTTP 4xx with a
   readable reason.
@@ -207,7 +208,8 @@ Content-Type: application/json
                     out.append(f"| `{n}` | {'yes' if req else 'no'} | "
                                f"{'' if d in (None,) else f'`{d}`'} |")
                 out.append("")
-    open(os.path.join(HERE, "api-reference.md"), "w").write("\n".join(out))  # nosemgrep: frappe-security-file-traversal -- path is derived from the app source tree, not from user input
+    with open(os.path.join(HERE, "api-reference.md"), "w") as md:  # nosemgrep: frappe-security-file-traversal -- path is derived from the app source tree, not from user input
+        md.write("\n".join(out))
     return total
 
 
@@ -265,7 +267,8 @@ def write_postman(modules):
         "item": items,
     }
     path = os.path.join(HERE, "public", "kamra.postman_collection.json")
-    open(path, "w").write(json.dumps(collection, indent=1))  # nosemgrep: frappe-security-file-traversal -- path is derived from the app source tree, not from user input
+    with open(path, "w") as collection_file:  # nosemgrep: frappe-security-file-traversal -- path is derived from the app source tree, not from user input
+        collection_file.write(json.dumps(collection, indent=1))
 
 
 if __name__ == "__main__":

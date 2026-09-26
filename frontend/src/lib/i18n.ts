@@ -1,69 +1,35 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { getLang, type Lang } from "./dir"
+import ar from "../i18n/locales/ar.json"
 
-/** Arabic strings, keyed by the English source. Grows incrementally - any
- * key without a translation falls back to English, so the app never breaks
- * as coverage expands. Covers the app/nav labels and common actions first. */
-const AR: Record<string, string> = {
-  // apps
-  "Front Desk": "الاستقبال",
-  "Housekeeping": "التدبير المنزلي",
-  "Operations": "العمليات",
-  "F&B": "المأكولات والمشروبات",
-  "Events": "الفعاليات",
-  "Revenue": "الإيرادات",
-  "Finance": "المالية",
-  "Booking Engine": "محرك الحجز",
-  "Admin": "الإدارة",
-  // front desk nav
-  "Today": "اليوم",
-  "Dashboard": "لوحة التحكم",
-  "Kamra Agent": "وكيل كامرا",
-  "Reservations": "الحجوزات",
-  "Central Reservations": "الحجوزات المركزية",
-  "Tape Chart": "مخطط الغرف",
-  "Calendar": "التقويم",
-  "Guests": "الضيوف",
-  "Room Blocks": "حجب الغرف",
-  // housekeeping / ops
-  "Room Board": "لوحة الغرف",
-  "Lost & Found": "المفقودات",
-  "Guest Requests": "طلبات الضيوف",
-  "SLA Report": "تقرير مستوى الخدمة",
-  "Shifts": "الورديات",
-  // f&b
-  "Restaurant POS": "نقطة بيع المطعم",
-  "Kitchen Display": "شاشة المطبخ",
-  "Menu": "القائمة",
-  "Outlets": "المنافذ",
-  // finance / revenue
-  "Billing": "الفوترة",
-  "Reports": "التقارير",
-  "Rate Plans": "خطط الأسعار",
-  "Seasons": "المواسم",
-  "Vouchers": "القسائم",
-  "Companies": "الشركات",
-  // common actions
-  "Search": "بحث",
-  "Save": "حفظ",
-  "Cancel": "إلغاء",
-  "Confirm": "تأكيد",
-  "Check in": "تسجيل الوصول",
-  "Check out": "تسجيل المغادرة",
-  "Arrivals": "الوصول",
-  "Departures": "المغادرة",
-  "In house": "داخل الفندق",
-  "Occupancy": "الإشغال",
-  "Revenue today": "إيرادات اليوم",
-  "New booking": "حجز جديد",
-  "Sign out": "تسجيل الخروج",
+/** Locale dictionaries keyed by English source string. Missing keys fall back
+ * to English so the app never blanks as coverage expands. */
+const DICT: Record<string, Record<string, string>> = {
+  en: {},
+  ar: ar as Record<string, string>,
 }
 
-const DICT: Record<Lang, Record<string, string>> = { en: {}, ar: AR }
+export type Vars = Record<string, string | number>
+
+/** Replace `{name}` placeholders in a template. Arabic (and others) can
+ * reorder words by placing the same placeholders differently. */
+function interpolate(template: string, vars?: Vars): string {
+  if (!vars) return template
+  return template.replace(/\{(\w+)\}/g, (_, k: string) =>
+    vars[k] !== undefined && vars[k] !== null ? String(vars[k]) : `{${k}}`,
+  )
+}
 
 /** Translate an English string for the current language (falls back to it). */
-export function t(s: string): string {
-  return DICT[getLang()][s] ?? s
+export function t(s: string, vars?: Vars): string {
+  const dict = DICT[getLang()] ?? {}
+  return interpolate(dict[s] ?? s, vars)
+}
+
+/** Translate for a specific language (e.g. offline export). */
+export function tFor(lang: Lang, s: string, vars?: Vars): string {
+  const dict = DICT[lang] ?? {}
+  return interpolate(dict[s] ?? s, vars)
 }
 
 /** Subscribe a component to the language: re-renders on change, returns a
@@ -75,5 +41,12 @@ export function useT() {
     window.addEventListener("kamra:lang", on)
     return () => window.removeEventListener("kamra:lang", on)
   }, [])
-  return { lang, t: (s: string) => DICT[lang][s] ?? s }
+  const t = useCallback(
+    (s: string, vars?: Vars) => {
+      const dict = DICT[lang] ?? {}
+      return interpolate(dict[s] ?? s, vars)
+    },
+    [lang],
+  )
+  return { lang, t }
 }

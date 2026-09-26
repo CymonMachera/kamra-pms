@@ -173,6 +173,12 @@ def open_orders(outlet: str):
 	return rows
 
 
+def _kot_tickets_of(doc) -> list:
+	raw = getattr(doc, "last_kot_ticket", None)
+	data = frappe.parse_json(raw) if raw else []
+	return data if isinstance(data, list) else []
+
+
 def _label(r) -> str:
 	"""A human tag for a bill: where it is, or who it's for."""
 	if r.get("room"):
@@ -429,6 +435,7 @@ def order_detail(order: str):
 		"delivery_address": doc.delivery_address,
 		"nc": doc.nc, "nc_authorized_by": doc.nc_authorized_by,
 		"nc_note": doc.nc_note,
+		"kot_tickets": _kot_tickets_of(doc),
 		"paid": doc.paid, "payment_mode": doc.payment_mode,
 		"discount_amount": doc.discount_amount, "discount_reason": doc.discount_reason,
 		"subtotal": doc.subtotal, "order_total": doc.order_total,
@@ -513,10 +520,13 @@ def fire_kot(order: str, course: str | None = None):
 	if course and not fired:
 		frappe.throw(_("Nothing is held on that course."))
 	if not doc.kot_no:
+		# Site-local "today", not MariaDB UTC date(now()) — those diverge after
+		# 18:30 UTC on IST sites and every KOT would reset to 1.
+		from frappe.utils import today
 		last = frappe.db.sql(
 			"""select max(kot_no) from `tabPOS Order`
-			   where outlet=%s and date(creation)=date(now())""",
-			doc.outlet)[0][0] or 0
+			   where outlet=%s and creation >= %s""",
+			(doc.outlet, today()))[0][0] or 0
 		doc.kot_no = int(last) + 1
 	doc.kot_fired = 1
 	if doc.status in ("Placed", "Confirmed"):
@@ -528,8 +538,26 @@ def fire_kot(order: str, course: str | None = None):
 	# reports itself as stale. See kamra/inventory.py.
 	from kamra.inventory import consume_for_lines
 	alerts = consume_for_lines(doc, fired_rows)
+	ticket = {
+		"kot_no": doc.kot_no, "at": now, "round": _next_kot_round(doc),
+		"nc": bool(doc.nc), "nc_by": doc.nc_authorized_by,
+		"label": _label(doc.as_dict()), "order_type": doc.order_type,
+		"order": doc.name, "customer": doc.customer_name,
+		"address": doc.delivery_address, "items": fired,
+	}
+	history = frappe.parse_json(doc.last_kot_ticket) if doc.last_kot_ticket else []
+	if not isinstance(history, list):
+		history = []
+	history.append(ticket)
+	doc.db_set("last_kot_ticket", frappe.as_json(history), update_modified=False)
 	return {"ok": True, "status": doc.status, "kot_no": doc.kot_no,
-	        "nc": bool(doc.nc), "fired_items": fired, "stock_alerts": alerts}
+	        "nc": bool(doc.nc), "fired_items": fired, "ticket": ticket,
+	        "stock_alerts": alerts}
+
+
+def _next_kot_round(doc) -> int:
+	history = frappe.parse_json(doc.last_kot_ticket) if doc.last_kot_ticket else []
+	return (len(history) if isinstance(history, list) else 0) + 1
 
 
 @frappe.whitelist()
@@ -704,10 +732,11 @@ def deliver_order(order: str):
 
 @frappe.whitelist(methods=["POST"])
 @require_roles(*POS_ROLES)
-def pay_order(order: str, mode: str):
+def pay_order(order: str, mode: str, pin: str | None = None):
 	"""Settle a bill at the outlet (walk-ins, takeaway - or a guest who'd
 	rather pay now than post to the room). Records the payment mode and
-	closes the order without touching any folio."""
+	closes the order without touching any folio. Posts into the open
+	cashier session so FO + POS cash reconcile together."""
 	if mode not in ("Cash", "Card", "UPI"):
 		frappe.throw(_("Pick a payment mode: Cash, Card or UPI."))
 	doc = frappe.get_doc("POS Order", order)
@@ -720,11 +749,25 @@ def pay_order(order: str, mode: str):
 	if doc.nc:
 		frappe.throw(_("This is an NC (complimentary) bill - close it with "
 		              "Deliver, there is nothing to collect."))
+	prop = doc.property
+	from kamra.authz import require_cashier_pin
+	require_cashier_pin(prop, pin)
+	from kamra.cashier import record_cashier_txn, require_open_session
+	sess = None
+	try:
+		sess = require_open_session(prop)
+	except Exception:
+		if "Kamra Agent" not in frappe.get_roles() and \
+		   frappe.session.user != "Administrator":
+			raise
 	doc.paid = 1
 	doc.payment_mode = mode
 	doc.status = "Delivered"
 	doc.save()
 	_flag_cleaning_if_freed(doc)
+	record_cashier_txn(
+		prop, "Payment", mode, float(doc.order_total or 0),
+		pos_order=doc.name, reference=f"POS {doc.name}", session=sess)
 	return {"ok": True, "status": "Delivered", "paid": True, "mode": mode,
 	        "order_total": doc.order_total}
 
@@ -824,4 +867,120 @@ def bill_data(order: str):
 		"paid": doc.paid, "payment_mode": doc.payment_mode,
 		"nc": doc.nc, "nc_authorized_by": doc.nc_authorized_by,
 		"nc_note": doc.nc_note,
+	}
+
+
+@frappe.whitelist()
+@require_roles(*POS_ROLES)
+def outlet_dashboard(outlet: str, date: str | None = None):
+	"""One shift at a glance: what the outlet sold, what's still open, the
+	exceptions that need a manager's eye (NC, voids, cancellations), and how
+	fast the kitchen is turning tickets. Defaults to today."""
+	day = frappe.utils.getdate(date) if date else frappe.utils.getdate()
+	start, end = f"{day} 00:00:00", f"{day} 23:59:59"
+
+	orders = frappe.get_all(
+		"POS Order",
+		filters={"outlet": outlet, "creation": ["between", [start, end]]},
+		fields=["name", "status", "order_type", "room", "table_no",
+		        "customer_name", "order_total", "subtotal", "paid",
+		        "payment_mode", "nc", "nc_authorized_by", "nc_note", "guests",
+		        "posted_to_folio", "notes", "kot_no", "creation", "modified"])
+	names = [o.name for o in orders]
+	items = frappe.get_all(
+		"POS Order Item",
+		filters={"parent": ["in", names], "parenttype": "POS Order"},
+		fields=["parent", "item_name", "qty", "rate", "voided",
+		        "void_reason", "fired_at", "prepared_at"]) if names else []
+
+	closed = [o for o in orders if o.status == "Delivered"]
+	sold = [o for o in closed if not o.nc]
+	open_bills = [o for o in orders if o.status in ("Placed", "Confirmed", "Preparing")]
+	cancelled = [o for o in orders if o.status == "Cancelled"]
+	nc_bills = [o for o in closed if o.nc]
+
+	gross = sum(float(o.order_total or 0) for o in sold)
+	covers = sum(int(o.guests or 0) for o in closed)
+
+	def bucket(rows, key):
+		out: dict[str, dict] = {}
+		for o in rows:
+			k = key(o) or "Other"
+			b = out.setdefault(k, {"bills": 0, "total": 0.0})
+			b["bills"] += 1
+			b["total"] += float(o.order_total or 0)
+		return [{"label": k, **v} for k, v in
+		        sorted(out.items(), key=lambda kv: -kv[1]["total"])]
+
+	def tender(o) -> str:
+		if o.posted_to_folio:
+			return "Room folio"
+		return o.payment_mode or "Unsettled"
+
+	# what actually sold (live lines of closed, non-NC bills)
+	sold_names = {o.name for o in sold}
+	top: dict[str, dict] = {}
+	for it in items:
+		if it.parent not in sold_names or it.voided:
+			continue
+		t = top.setdefault(it.item_name, {"qty": 0.0, "amount": 0.0})
+		t["qty"] += float(it.qty or 0)
+		t["amount"] += float(it.qty or 0) * float(it.rate or 0)
+	top_items = [{"item_name": k, **v} for k, v in
+	             sorted(top.items(), key=lambda kv: -kv[1]["qty"])][:10]
+
+	voids = [{
+		"order": it.parent,
+		"label": _label(next((o for o in orders if o.name == it.parent), {"name": it.parent})),
+		"item_name": it.item_name, "qty": it.qty,
+		"amount": float(it.qty or 0) * float(it.rate or 0),
+		"reason": it.void_reason,
+	} for it in items if it.voided]
+
+	# kitchen pace: fired -> prepared, over lines that finished today
+	waits = []
+	for it in items:
+		if it.fired_at and it.prepared_at:
+			secs = (frappe.utils.get_datetime(it.prepared_at)
+			        - frappe.utils.get_datetime(it.fired_at)).total_seconds()
+			if secs >= 0:
+				waits.append(secs)
+	avg_fire_to_ready = round(sum(waits) / len(waits) / 60, 1) if waits else None
+
+	def cancel_reason(o) -> str | None:
+		for line in reversed((o.notes or "").splitlines()):
+			if line.startswith("Cancelled: "):
+				return line[len("Cancelled: "):]
+		return None
+
+	return {
+		"outlet": outlet, "date": str(day),
+		"gross_sales": round(gross, 2),
+		"bills": len(sold),
+		"covers": covers,
+		"avg_bill": round(gross / len(sold), 2) if sold else 0,
+		"by_order_type": bucket(sold, lambda o: o.order_type),
+		"by_tender": bucket(sold, tender),
+		"open_bills": [{
+			"name": o.name, "label": _label(o), "status": o.status,
+			"order_type": o.order_type, "order_total": o.order_total,
+			"kot_no": o.kot_no, "creation": str(o.creation),
+		} for o in sorted(open_bills, key=lambda o: o.creation)],
+		"nc": {
+			"count": len(nc_bills),
+			# an NC bill's order_total is forced to zero; what it *cost* the
+			# house is the subtotal it would have billed
+			"value": round(sum(float(o.subtotal or 0) for o in nc_bills), 2),
+			"bills": [{
+				"name": o.name, "label": _label(o), "subtotal": o.subtotal,
+				"authorized_by": o.nc_authorized_by, "note": o.nc_note,
+			} for o in nc_bills],
+		},
+		"voids": voids,
+		"cancellations": [{
+			"name": o.name, "label": _label(o),
+			"order_total": o.order_total, "reason": cancel_reason(o),
+		} for o in cancelled],
+		"top_items": top_items,
+		"avg_fire_to_ready_mins": avg_fire_to_ready,
 	}

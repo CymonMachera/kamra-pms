@@ -1,6 +1,5 @@
 import frappe
-from frappe.utils import today, add_days
-from kamra.api import set_room_rate, cancel_reservation, pending_deposit_refunds
+from kamra.api import set_room_rate, cancel_reservation
 from kamra.pricing import quote
 
 def run_tests():
@@ -48,7 +47,7 @@ def run_tests():
 		"max_total_occupants": 3,
 	}).insert(ignore_permissions=True)
 	
-	rt_villa = frappe.get_doc({
+	frappe.get_doc({
 		"doctype": "Room Type",
 		"property": prop.name,
 		"room_type_code": "VILLA",
@@ -200,7 +199,7 @@ def run_tests():
 	finally:
 		# Guarantee Cleanup
 		cleanup_test_data(prop_name)
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit -- bench script runs outside the request cycle; persist cleanup before the process exits
 		print("--- Generic Test Cleanup Complete & All Tests Passed! ---")
 
 def cleanup_test_data(property_name):

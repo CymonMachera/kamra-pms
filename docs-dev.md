@@ -153,16 +153,15 @@ bench --site kamra.localhost migrate
 - **Guest blacklist**: flag on Guest; new bookings for flagged guests are
   refused with the reason
 
-## What works in v4 (MCP — connect Claude to the PMS)
+## MCP — connect Claude to the PMS
 
-- **MCP server** at `apps/kamra/mcp/kamra_mcp.py` — 14 tools (availability,
-  quote, create_booking, check-in/out, guest lookup/journey, tickets,
-  folio charges, night audit). Auth: dedicated `agent@kamra.local` user
-  with API keys and the scoped **Kamra Agent** role — the AI is a user,
-  every action permission-checked and audit-logged.
-- Regenerate agent keys: `kamra.scripts.seed_rbac_v2.execute` (prints them).
+- **Hosted MCP** at `/mcp` — OAuth 2.1 + PKCE, 85 tools from
+  `kamra.mcp_tools`, filtered by user roles and the property's enabled
+  modules. Staff: Kamra Agent → Connect Claude.
+- **Stdio sidecar** at `apps/kamra/mcp/kamra_mcp.py` for localhost /
+  air-gapped benches (personal API key from Developers).
 - Connect Claude Code:
-  `claude mcp add kamra -e KAMRA_URL=... -e KAMRA_API_KEY=... -e KAMRA_API_SECRET=... -- <app>/mcp/.venv/bin/python <app>/mcp/kamra_mcp.py`
+  `claude mcp add --transport http kamra https://<site>/mcp`
 
 ### RBAC
 

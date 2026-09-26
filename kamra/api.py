@@ -175,6 +175,9 @@ def set_room_rate(property: str, room_type: str, start_date: str,
 		"doctype": "Season",
 		"property": property,
 		"season_name": f"Rate set {room_type.split('-')[-1]} {start_date}→{end_date}{season_name_suffix}",
+		# scope it to the room type the caller priced - a blank room_type
+		# would set this rate for every room type in the house
+		"room_type": room_type,
 		"start_date": start_date,
 		"end_date": end_date,
 		"adjustment_type": "Absolute",
@@ -308,6 +311,15 @@ def setup_property(payload):
 
 	prop = frappe.get_doc({"doctype": "Property", **p})
 	prop.insert()
+	try:
+		from kamra.turnover import ensure_default_profile
+		from kamra.property_presets import KIND_STR, normalize_kind
+		ensure_default_profile(
+			prop.name,
+			str_defaults=normalize_kind(prop.property_kind) == KIND_STR,
+		)
+	except Exception:
+		frappe.log_error(title="Turnover Profile ensure after setup_property")
 
 	rt_by_code = {}
 	weekends_created = 0
@@ -551,8 +563,17 @@ def registration_card(reservation: str):
 @require_roles("Finance", "Front Desk", "Kamra Agent")
 def cash_summary(property: str, date: str | None = None):
 	"""Cashier reconciliation: what the system says was collected today,
-	per payment mode - the number the drawer must match at shift close."""
-	date = date or nowdate()
+	per payment mode - the number the drawer must match at shift close.
+
+	Prefers Cashier Transaction totals (FO + POS); falls back to folio
+	payments for properties that have not opened a till yet."""
+	from kamra.business_date import get_business_date
+	date = date or get_business_date(property)
+	try:
+		from kamra.cashier import cash_summary_v2
+		return cash_summary_v2(property, date)
+	except Exception:
+		pass
 	rows = frappe.db.sql(
 		"""
 		SELECT fp.mode, COUNT(*) AS txns, COALESCE(SUM(fp.amount), 0) AS total
@@ -564,20 +585,32 @@ def cash_summary(property: str, date: str | None = None):
 		{"property": property, "date": date}, as_dict=True,
 	)
 	return {"date": date, "modes": rows,
-	        "grand_total": float(sum(r.total for r in rows))}
+	        "grand_total": float(sum(r.total for r in rows)),
+	        "source": "folio"}
 
 
 @frappe.whitelist()
 @require_roles("Front Desk", "Kamra Agent")
 def record_advance(reservation: str, amount: float, mode: str = "UPI",
                    reference: str | None = None):
-	"""Advance/deposit against a Confirmed booking - opens the folio early
+	"""Advance/deposit against a live booking - opens the folio early
 	so the money sits on the stay from day one (GM gap: deposits arrive at
-	booking, not at check-in)."""
+	booking, not at check-in). Pending Payment → Confirmed when paid."""
 	res = frappe.get_doc("Reservation", reservation)
-	if res.status not in ("Confirmed", "Checked In"):
-		frappe.throw("Advances only apply to active reservations.")
+	if res.status not in ("Confirmed", "Checked In", "Pending Payment", "Held"):
+		frappe.throw("Advances only apply to active or held reservations.")
 	from kamra.folio import _recalculate, open_folio
+
+	# Promote Pending Payment / Held → Confirmed before opening folio.
+	if res.status in ("Pending Payment", "Held"):
+		frappe.flags.kamra_status_transition = True
+		try:
+			res.status = "Confirmed"
+			res.hold_expires_on = None
+			res.save(ignore_permissions=True)
+		finally:
+			frappe.flags.kamra_status_transition = False
+		res.reload()
 
 	folio = frappe.get_doc("Folio", open_folio(res))
 	folio.append("payments", {
@@ -593,7 +626,68 @@ def record_advance(reservation: str, amount: float, mode: str = "UPI",
 	from kamra.savings import log_action
 	log_action("record_advance", "Folio", folio.name, res.property,
 	           rationale=f"₹{float(amount):,.0f} advance on {reservation}")
-	return {"folio": folio.name, "balance": folio.balance}
+	return {"folio": folio.name, "balance": folio.balance,
+	        "status": res.status}
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Finance", "Kamra Agent")
+def collect_security_deposit(reservation: str, amount: float,
+                             mode: str = "UPI", reference: str | None = None):
+	from kamra.deposit import collect_deposit
+	return collect_deposit(reservation, amount, mode=mode, reference=reference)
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Hotel Admin", "Kamra Agent")
+def waive_security_deposit(reservation: str, reason: str):
+	from kamra.deposit import waive_deposit
+	return waive_deposit(reservation, reason)
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Hotel Admin", "Finance")
+def withhold_security_deposit(reservation: str, amount: float, reason: str,
+                              evidence: str | None = None):
+	from kamra.deposit import withhold_deposit
+	return withhold_deposit(reservation, amount, reason, evidence)
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Finance", "Hotel Admin")
+def refund_security_deposit(reservation: str, amount: float | None = None,
+                            reference: str | None = None):
+	from kamra.deposit import refund_deposit
+	return refund_deposit(reservation, amount, reference)
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Hotel Admin", "Kamra Agent")
+def release_access_instructions(reservation: str, force: int = 0):
+	from kamra.access import release_access
+	return release_access(reservation, force=int(force or 0))
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Hotel Admin", "Kamra Agent")
+def confirm_pending_reservation(reservation: str):
+	"""Mark Held / Pending Payment / Requested as Confirmed (host or payment)."""
+	res = frappe.get_doc("Reservation", reservation)
+	if res.status not in ("Held", "Pending Payment", "Requested", "Waitlist"):
+		frappe.throw(f"Cannot confirm from status {res.status}.")
+	frappe.flags.kamra_status_transition = True
+	try:
+		res.status = "Confirmed"
+		res.hold_expires_on = None
+		res.save(ignore_permissions=True)
+	finally:
+		frappe.flags.kamra_status_transition = False
+	try:
+		from kamra.deposit import ensure_deposit_for_reservation
+		ensure_deposit_for_reservation(res)
+	except Exception:
+		frappe.log_error(title="Security deposit ensure on confirm failed")
+	return {"reservation": res.name, "status": res.status}
 
 
 @frappe.whitelist()
@@ -693,6 +787,19 @@ def hk_queue(property: str):
 		t["special_requests"] = t.get("special_requests") or c.get("special_requests")
 		t["eta"] = c.get("eta")
 
+	# completion media (proof-of-clean photos/videos) attached to each task
+	task_names = [t.name for t in tasks]
+	media = {}
+	if task_names:
+		for f in frappe.get_all(
+			"File",
+			filters={"attached_to_doctype": "Housekeeping Task",
+			         "attached_to_name": ("in", task_names)},
+			fields=["attached_to_name", "file_url"], order_by="creation asc"):
+			media.setdefault(f.attached_to_name, []).append(f.file_url)
+	for t in tasks:
+		t["media"] = media.get(t.name, [])
+
 	return {"date": today, "tasks": tasks, "rooms": rooms}
 
 
@@ -712,6 +819,91 @@ def hk_update_task(task: str, status: str):
 		           rationale=f"{doc.task_type} for {doc.room} closed from mobile",
 		           channel="API")
 	return {"ok": True, "task": doc.name, "status": doc.status}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Housekeeping", "Front Desk", "Kamra Agent")
+def hk_upload_media(task: str):
+	"""Attach a completion photo/video (proof of clean) to a housekeeping task.
+
+	Uploaded from the housekeeper's phone while the room is being serviced. Stored
+	public and attached to the task, so it stays with the record after the task
+	closes and drops out of the live queue."""
+	if not frappe.db.exists("Housekeeping Task", task):
+		frappe.throw("Task not found.")
+	req = getattr(frappe.local, "request", None)
+	files = getattr(req, "files", {}) if req else {}
+	if "file" not in files:
+		frappe.throw("No file uploaded.")
+	f = files["file"]
+	content = f.stream.read()
+	if len(content) > 25 * 1024 * 1024:
+		frappe.throw("File is too large - keep photos/videos under 25 MB.")
+	# endpoint-gated (Kamra authorizes on the route, not the doctype), so the
+	# File is created ignore_permissions and attached to the task.
+	saved = frappe.get_doc({
+		"doctype": "File",
+		"file_name": f.filename,
+		"content": content,
+		"attached_to_doctype": "Housekeeping Task",
+		"attached_to_name": task,
+		"is_private": 0,
+	}).insert(ignore_permissions=True)
+	from kamra.savings import log_action
+	log_action("hk_media_upload", "Housekeeping Task", task,
+	           frappe.db.get_value("Housekeeping Task", task, "property"),
+	           rationale=f"Completion media added to {task}", channel="API")
+	return {"file_url": saved.file_url, "file_name": saved.file_name}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Housekeeping", "Front Desk", "Kamra Agent")
+def hk_delete_media(task: str, file_url: str):
+	"""Remove a completion photo/video from a housekeeping task."""
+	name = frappe.db.get_value("File", {
+		"attached_to_doctype": "Housekeeping Task",
+		"attached_to_name": task,
+		"file_url": file_url,
+	})
+	if not name:
+		frappe.throw("That file is not attached to this task.")
+	frappe.delete_doc("File", name, ignore_permissions=True)
+	return {"ok": True}
+
+
+@frappe.whitelist()
+@require_roles("Housekeeping", "Front Desk", "Hotel Admin", "Kamra Agent")
+def hk_task_media(task: str):
+	"""Completion photos/videos attached to one housekeeping task (newest first)."""
+	return frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": "Housekeeping Task",
+		         "attached_to_name": task},
+		fields=["file_url"], order_by="creation desc", pluck="file_url")
+
+
+@frappe.whitelist()
+@require_roles("Housekeeping", "Front Desk", "Hotel Admin", "Kamra Agent")
+def hk_room_media(room: str):
+	"""Photos/videos from the room's LATEST cleaning only - so the front desk
+	sees just the most recent clean, not older cycles. Lets reception confirm a
+	room is genuinely guest-ready."""
+	tasks = frappe.get_all("Housekeeping Task", filters={"room": room}, pluck="name")
+	if not tasks:
+		return []
+	# the newest attached file marks the most recent cleaning that has media
+	latest = frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": "Housekeeping Task",
+		         "attached_to_name": ("in", tasks)},
+		fields=["attached_to_name"], order_by="creation desc", limit=1)
+	if not latest:
+		return []
+	return frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": "Housekeeping Task",
+		         "attached_to_name": latest[0].attached_to_name},
+		fields=["file_url"], order_by="creation asc", pluck="file_url")
 
 
 @frappe.whitelist(methods=["POST"])
@@ -814,11 +1006,11 @@ def hk_post_consumable(room: str, charge_type: str, description: str,
 	# the housekeeper is authorized above and scoped to two charge types, and
 	# GST is still resolved server-side. Attribution is stamped below.
 	me = frappe.session.user
-	frappe.set_user("agent@kamra.local")
+	frappe.set_user("agent@kamra.local")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	try:
 		out = post_stay_charge(res.name, charge_type, description, float(amount))
 	finally:
-		frappe.set_user(me)
+		frappe.set_user(me)  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	from kamra.savings import log_action
 	log_action("hk_charge", "Folio", out.get("folio"), res.property,
 	           rationale=f"{charge_type} ₹{amount} to {room} ({description})")
@@ -927,9 +1119,14 @@ def add_folio_charge(folio: str, charge_type: str, description: str,
 	# F&B/minibar charge posted without a rate lands on the bill untaxed
 	gst_rate = _resolve_charge_gst(doc.property, charge_type, description,
 	                               int(is_alcohol or 0), float(gst_rate or 0))
+	from kamra.business_date import get_business_date
+	from kamra.ledger import code_for_charge_type, record_charge_ledger
+	bd = posting_date or get_business_date(doc.property)
+	code = code_for_charge_type(charge_type)
 	doc.append("charges", {
-		"posting_date": posting_date or nowdate(),
+		"posting_date": bd,
 		"charge_type": charge_type,
+		"transaction_code": code,
 		"reservation": reservation or doc.reservation,
 		"description": description,
 		"qty": 1,
@@ -941,6 +1138,11 @@ def add_folio_charge(folio: str, charge_type: str, description: str,
 	from kamra.folio import _recalculate
 	_recalculate(doc)
 	doc.save()
+	charge = doc.charges[-1]
+	try:
+		record_charge_ledger(doc, charge.as_dict())
+	except Exception:
+		frappe.log_error(title="ledger charge write failed")
 	from kamra.savings import log_action
 	log_action("post_charge", "Folio", doc.name, doc.property,
 	           rationale=f"{charge_type}: {description} ₹{amount}")
@@ -968,8 +1170,18 @@ def add_folio_payment(folio: str, mode: str, amount: float,
 		frappe.throw("Amount must be positive.")
 	_pin_guard(folio, pin)
 	doc = frappe.get_doc("Folio", folio)
+	from kamra.business_date import get_business_date
+	from kamra.cashier import record_cashier_txn, require_open_session
+	bd = get_business_date(doc.property)
+	sess = None
+	try:
+		sess = require_open_session(doc.property)
+	except Exception:
+		if "Kamra Agent" not in frappe.get_roles() and \
+		   frappe.session.user != "Administrator":
+			raise
 	doc.append("payments", {
-		"posting_date": nowdate(),
+		"posting_date": bd,
 		"payment_kind": kind,
 		"mode": mode,
 		"amount": float(amount),
@@ -978,25 +1190,40 @@ def add_folio_payment(folio: str, mode: str, amount: float,
 	from kamra.folio import _recalculate
 	_recalculate(doc)
 	doc.save()
+	pay = doc.payments[-1]
+	record_cashier_txn(
+		doc.property, "Payment", mode, float(amount),
+		folio=doc.name, reference=reference, session=sess)
+	try:
+		from kamra.ledger import record_payment_ledger
+		record_payment_ledger(doc, pay.as_dict(), session=sess)
+	except Exception:
+		frappe.log_error(title="ledger payment write failed")
 	return doc.as_dict()
 
 
 @frappe.whitelist(methods=["POST"])
 @require_roles("Finance", "Front Desk", "Kamra Agent")
 def refund_folio_payment(folio: str, amount: float, mode: str,
-                         reason: str, pin: str | None = None):
+                         reason: str, pin: str | None = None,
+                         reason_code: str | None = None,
+                         supervisor_pin: str | None = None):
 	"""Give money back on an open folio - a held security deposit at
 	checkout, or an over-collected advance. Stored as a negative ledger
 	row so every balance still sums exactly; a reason is mandatory."""
 	if float(amount) <= 0:
 		frappe.throw("Refund amount must be positive.")
-	if not (reason or "").strip():
+	if not (reason or "").strip() and not reason_code:
 		frappe.throw("A refund reason is required.")
 	_pin_guard(folio, pin)
 	doc = frappe.get_doc("Folio", folio)
 	if doc.status == "Closed":
 		frappe.throw("This folio is closed - refunds need a credit note "
 		             "via allowance on a new folio.")
+	from kamra.ledger import require_reason
+	reason_text = require_reason(
+		"Refund", reason_code, reason or "",
+		supervisor_pin=supervisor_pin, property=doc.property)
 	received = sum(float(p.amount or 0) for p in doc.payments
 	               if float(p.amount or 0) > 0)
 	refunded = -sum(float(p.amount or 0) for p in doc.payments
@@ -1004,16 +1231,35 @@ def refund_folio_payment(folio: str, amount: float, mode: str,
 	if float(amount) > received - refunded:
 		frappe.throw(f"Only ₹{received - refunded:,.2f} was collected on "
 		             "this folio - can't refund more than that.")
+	from kamra.business_date import get_business_date
+	from kamra.cashier import record_cashier_txn, require_open_session
+	bd = get_business_date(doc.property)
+	sess = None
+	try:
+		sess = require_open_session(doc.property)
+	except Exception:
+		if "Kamra Agent" not in frappe.get_roles() and \
+		   frappe.session.user != "Administrator":
+			raise
 	doc.append("payments", {
-		"posting_date": nowdate(),
+		"posting_date": bd,
 		"payment_kind": "Refund",
 		"mode": mode,
 		"amount": -float(amount),
-		"reference": reason.strip()[:140],
+		"reference": str(reason_text)[:140],
 	})
 	from kamra.folio import _recalculate
 	_recalculate(doc)
 	doc.save()
+	pay = doc.payments[-1]
+	record_cashier_txn(
+		doc.property, "Refund", mode, -float(amount),
+		folio=doc.name, reference=str(reason_text)[:140], session=sess)
+	try:
+		from kamra.ledger import record_payment_ledger
+		record_payment_ledger(doc, pay.as_dict(), session=sess)
+	except Exception:
+		frappe.log_error(title="ledger refund write failed")
 	return {"ok": True, "balance": doc.balance}
 
 
@@ -1064,13 +1310,24 @@ def _resolve_charge_gst(property: str, charge_type: str, description: str,
 @frappe.whitelist()
 @require_roles("Finance", "Front Desk", "Kamra Agent")
 def void_folio_charge(folio: str, charge_row: str, reason: str = "",
-                      pin: str | None = None):
+                      pin: str | None = None,
+                      reason_code: str | None = None,
+                      supervisor_pin: str | None = None):
 	"""Remove a wrong charge line from an open folio (the bill-correction
 	path). PIN-guarded like other money actions for humans; agents are
-	accountable through the action log."""
+	accountable through the action log. Posts a ledger reversal."""
 	_pin_guard(folio, pin)
+	prop = frappe.db.get_value("Folio", folio, "property")
+	from kamra.ledger import require_reason, reverse_ledger_for_charge
+	reason_text = require_reason(
+		"Void", reason_code, reason or "",
+		supervisor_pin=supervisor_pin, property=prop)
+	try:
+		reverse_ledger_for_charge(prop, folio, charge_row, str(reason_text))
+	except Exception:
+		frappe.log_error(title="ledger void reversal failed")
 	from kamra.folio import void_charge
-	return void_charge(folio, charge_row, reason)
+	return void_charge(folio, charge_row, str(reason_text))
 
 
 @frappe.whitelist()
@@ -1295,6 +1552,14 @@ def group_folios(group_booking: str):
 @require_roles("Finance", "Front Desk", "Kamra Agent")
 def close_folio(folio: str, pin: str | None = None):
 	_pin_guard(folio, pin)
+	prop = frappe.db.get_value("Folio", folio, "property")
+	try:
+		from kamra.cashier import require_open_session
+		require_open_session(prop)
+	except Exception:
+		if "Kamra Agent" not in frappe.get_roles() and \
+		   frappe.session.user != "Administrator":
+			raise
 	from kamra.folio import close_folio as _close
 	invoice_number = _close(folio)
 	return {"invoice_number": invoice_number}
@@ -1478,6 +1743,7 @@ def _invoice_guest(res) -> dict:
 		["full_name", "phone", "email", "nationality", "address_line",
 		 "city", "id_type", "id_number"], as_dict=True) or {}
 	return {
+		"guest_id": res.guest,
 		"name": g.get("full_name") or res.guest_name,
 		"phone": g.get("phone"), "email": g.get("email"),
 		"nationality": g.get("nationality"),
@@ -1571,6 +1837,9 @@ def guest_search(q: str):
 _GUEST_LINKS = [  # every doctype that points at a Guest
 	("Reservation", "guest"), ("Folio", "guest"),
 	("Service Ticket", "guest"), ("Lost And Found Item", "guest"),
+	("Security Deposit", "guest"),
+	("Venue Booking", "customer"),  # banquet uses customer, not guest
+	("WhatsApp Message", "guest"),
 ]
 
 
@@ -1588,6 +1857,10 @@ def merge_guests(source: str, target: str):
 
 	moved = {}
 	for doctype, field in _GUEST_LINKS:
+		if not frappe.db.exists("DocType", doctype):
+			continue
+		if not frappe.get_meta(doctype).has_field(field):
+			continue
 		rows = frappe.get_all(doctype, filters={field: source}, pluck="name")
 		for name in rows:
 			frappe.db.set_value(doctype, name, field, target,
@@ -1623,38 +1896,11 @@ def merge_guests(source: str, target: str):
 @frappe.whitelist()
 @require_roles()
 def anonymize_guest(guest: str):
-	"""Right-to-erasure: strip everything that identifies the person while
-	keeping stays and bills intact for the books. Irreversible."""
-	doc = frappe.get_doc("Guest", guest)
-	alias = f"Guest {frappe.generate_hash(length=6).upper()}"
-	doc.update({
-		"first_name": alias, "last_name": "", "full_name": alias,
-		"phone": "", "email": "", "id_type": "", "id_number": "",
-		"nationality": "", "address_line": "", "city": "",
-		"guest_notes": "Profile anonymized on request.", "vip": 0,
-	})
-	doc.save(ignore_permissions=True)
-	for doctype in ("Reservation", "Folio"):
-		frappe.db.sql(  # nosemgrep: frappe-sql-format-injection -- values are parameterized; interpolated text is a constant or whitelisted identifier, not user input
-			f"UPDATE `tab{doctype}` SET guest_name = %s WHERE guest = %s",
-			(alias, guest))
-	# the stay register keeps masked IDs only
-	for r in frappe.get_all("Reservation", filters={"guest": guest},
-	                        pluck="name"):
-		res = frappe.get_doc("Reservation", r)
-		for o in res.get("occupants") or []:
-			if o.id_number:
-				frappe.db.set_value("Stay Occupant", o.name, "id_number",
-				                    _mask_id(o.id_number),
-				                    update_modified=False)
-		if res.get("booked_by_phone"):
-			frappe.db.set_value("Reservation", r, "booked_by_phone", "",
-			                    update_modified=False)
+	"""Right to erasure (DPDP s.12): see kamra.privacy.erase_guest. Stays
+	and bills stay for the books. Irreversible."""
+	from kamra.privacy import erase_guest
 
-	from kamra.savings import log_action
-	log_action("anonymize_guest", "Guest", guest,
-	           rationale="PII erased; financial records preserved")
-	return {"guest": guest, "alias": alias}
+	return erase_guest(guest, reason="request")
 
 
 @frappe.whitelist()
@@ -2336,24 +2582,11 @@ CANCEL_REASONS = ["Guest request", "Change of plans", "Duplicate booking",
                   "Booked elsewhere", "Other"]
 
 
-@frappe.whitelist()
-@require_roles("Front Desk", "Kamra Agent")
-def cancel_reservation(reservation: str, reason: str = "Guest request",
-                       note: str | None = None, waive_fee: int = 0,
-                       agent: str | None = None, issue_credit_note: int = 0):
-	"""Cancel a booking, applying the property's cancellation policy:
-	free outside the window, else the configured fee lands on the folio.
-	Issues a cancellation number the guest can hold on to. Pass
-	waive_fee=1 to cancel graciously (logged).
-
-	The cancellation is recorded in the action log.
-	"""
+def _do_cancel(res, reason: str = "Guest request", note: str | None = None,
+               waive_fee: int = 0, issue_credit_note: int = 0) -> dict:
+	"""Shared cancel path for desk API and OTA channel manager."""
 	from frappe.model.naming import make_autoname
 
-	res = frappe.get_doc("Reservation", reservation)
-	if res.status != "Confirmed":
-		frappe.throw("Only confirmed bookings can be cancelled - "
-		             "checked-in stays check out.")
 	if reason not in CANCEL_REASONS:
 		reason = "Other"
 	terms = _cancellation_terms(res)
@@ -2377,7 +2610,10 @@ def cancel_reservation(reservation: str, reason: str = "Guest request",
 	res.cancelled_on = frappe.utils.now_datetime()
 	frappe.flags.kamra_cancelling = True
 	try:
-		res.save()
+		# ignore_permissions: both callers are pre-authorized — the desk wrapper
+		# via @require_roles, the OTA webhook worker as a trusted internal caller
+		# (it runs as Guest). Validation (villa lockout etc.) still runs.
+		res.save(ignore_permissions=True)
 	finally:
 		frappe.flags.kamra_cancelling = False
 
@@ -2388,7 +2624,7 @@ def cancel_reservation(reservation: str, reason: str = "Guest request",
 			import random, string
 			code_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 			voucher_code = f"CN-{res.name.split('-')[-1]}-{code_suffix}"
-			
+
 			from frappe.utils import add_days, today
 			voucher = frappe.get_doc({
 				"doctype": "Discount Voucher",
@@ -2411,6 +2647,26 @@ def cancel_reservation(reservation: str, reason: str = "Guest request",
 	        "cancellation_number": res.cancellation_number,
 	        "fee": fee, "waived": bool(int(waive_fee or 0)),
 	        "credit_note_voucher": voucher_code}
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Kamra Agent")
+def cancel_reservation(reservation: str, reason: str = "Guest request",
+                       note: str | None = None, waive_fee: int = 0,
+                       agent: str | None = None, issue_credit_note: int = 0):
+	"""Cancel a booking, applying the property's cancellation policy:
+	free outside the window, else the configured fee lands on the folio.
+	Issues a cancellation number the guest can hold on to. Pass
+	waive_fee=1 to cancel graciously (logged).
+
+	The cancellation is recorded in the action log.
+	"""
+	res = frappe.get_doc("Reservation", reservation)
+	if res.status != "Confirmed":
+		frappe.throw("Only confirmed bookings can be cancelled - "
+		             "checked-in stays check out.")
+	return _do_cancel(res, reason=reason, note=note, waive_fee=waive_fee,
+	                  issue_credit_note=issue_credit_note)
 
 
 @frappe.whitelist()
@@ -2464,7 +2720,7 @@ def check_out(reservation: str):
 @frappe.whitelist()
 @require_roles("Housekeeping", "Front Desk", "Kamra Agent")
 def set_housekeeping_status(room: str, status: str):
-	allowed = {"Clean", "Dirty", "Inspected", "Out of Order"}
+	allowed = {"Clean", "Dirty", "Inspected", "Ready", "Out of Order"}
 	if status not in allowed:
 		frappe.throw(f"Invalid status. Use one of {sorted(allowed)}")
 	frappe.db.set_value("Room", room, "housekeeping_status", status)
@@ -2504,7 +2760,8 @@ def availability_calendar(property: str, start_date: str | None = None, days: in
 				cells.append({
 					"date": str(date),
 					"available": caps[i] if i < len(caps) else 0,
-					"rate": float(season_adjust(property, date, base)),
+					"rate": float(season_adjust(property, date, base,
+					                            rt.name)),
 				})
 		else:
 			total = frappe.db.count(
@@ -2531,7 +2788,8 @@ def availability_calendar(property: str, start_date: str | None = None, days: in
 				cells.append({
 					"date": str(date),
 					"available": max(0, total - taken),
-					"rate": float(season_adjust(property, date, base)),
+					"rate": float(season_adjust(property, date, base,
+					                            rt.name)),
 				})
 		rows.append({
 			"room_type": rt.name,
@@ -2943,12 +3201,21 @@ def venue_calendar(property: str, start_date: str | None = None, days: int = 14)
 @frappe.whitelist()
 @require_roles("Front Desk", "Kamra Agent")
 def move_reservation(reservation: str, new_room: str):
-	"""Room move - mid-stay or before arrival. Overlap guard re-runs."""
+	"""Room move / upgrade - mid-stay or before arrival. Overlap guard re-runs.
+
+	The new room may be a DIFFERENT room type (e.g. Standard -> Suite): the
+	reservation's room type follows the room it moves into, so upgrades and
+	downgrades are allowed. If the booking auto-prices, the new type's rate
+	applies; a manually-priced booking keeps its amount."""
 	doc = frappe.get_doc("Reservation", reservation)
 	if doc.status not in ("Confirmed", "Checked In"):
 		frappe.throw("Only active reservations can be moved.")
 	old_room = doc.room
+	old_type = doc.room_type
+	new_type = frappe.db.get_value("Room", new_room, "room_type")
 	doc.room = new_room
+	if new_type and new_type != doc.room_type:
+		doc.room_type = new_type  # upgrade / downgrade
 	doc.save()
 	if doc.status == "Checked In" and old_room and old_room != new_room:
 		frappe.db.set_value("Room", old_room,
@@ -2956,9 +3223,49 @@ def move_reservation(reservation: str, new_room: str):
 		                     "housekeeping_status": "Dirty"})
 		frappe.db.set_value("Room", new_room, "occupancy_status", "Occupied")
 	from kamra.savings import log_action
-	log_action("room_move", "Reservation", doc.name, doc.property,
-	           rationale=f"{old_room} → {new_room}")
-	return {"ok": True, "room": doc.room}
+	note = f"{old_room} → {new_room}"
+	if new_type and new_type != old_type:
+		note += f" · {old_type} → {new_type}"
+	log_action("room_move", "Reservation", doc.name, doc.property, rationale=note)
+	return {"ok": True, "room": doc.room, "room_type": doc.room_type}
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Kamra Agent")
+def movable_rooms(reservation: str, check_in_date: str | None = None,
+                  check_out_date: str | None = None):
+	"""Every room the booking could move into - across ALL room types, so the
+	front desk can upgrade (Standard -> Suite) as well as swap same-type. Each
+	room is flagged free/occupied for the dates and carries its type name; the
+	booking's current type is listed first."""
+	res = frappe.get_doc("Reservation", reservation)
+	ci = check_in_date or res.check_in_date
+	co = check_out_date or res.check_out_date
+	rooms = frappe.get_all(
+		"Room", filters={"property": res.property},
+		fields=["name", "room_number", "room_type"], order_by="room_number")
+	# availability is computed per type; union the free rooms across every type
+	types = {r.room_type for r in rooms}
+	free = set()
+	for rt in types:
+		free |= {r.name for r in _available_rooms_raw(res.property, rt, ci, co)}
+	type_name = {
+		t: (frappe.db.get_value("Room Type", t, "room_type_name") or t)
+		for t in types
+	}
+	out = [
+		{"name": r.name, "room_number": r.room_number,
+		 "room_type": r.room_type,
+		 "room_type_name": type_name.get(r.room_type, r.room_type),
+		 # the guest's own current room counts as available to them
+		 "free": r.name in free or r.name == res.room,
+		 "same_type": r.room_type == res.room_type}
+		for r in rooms
+	]
+	# current type first, then the rest - so a same-type swap is the default and
+	# upgrades/downgrades follow
+	out.sort(key=lambda r: (not r["same_type"], r["room_type_name"], r["room_number"]))
+	return out
 
 
 @frappe.whitelist()
@@ -3016,13 +3323,26 @@ def booking_options(property: str):
 			        "gst_rate"],
 			order_by="price asc",
 		),
-		"property": frappe.db.get_value(
-			"Property", property,
-			["sell_message", "free_cancel_days", "cancellation_fee",
-			 "no_show_charge", "deposit_pct"],
-			as_dict=True,
-		),
+		"property": _booking_property_policy(property),
 	}
+
+
+def _booking_property_policy(property: str) -> dict:
+	"""Property policy fields for the booking dialog — never null strings."""
+	prop = frappe.db.get_value(
+		"Property", property,
+		["sell_message", "free_cancel_days", "cancellation_fee",
+		 "no_show_charge", "deposit_pct", "country"],
+		as_dict=True,
+	) or {}
+	prop["cancellation_fee"] = prop.get("cancellation_fee") or "None"
+	prop["no_show_charge"] = prop.get("no_show_charge") or "None"
+	prop["free_cancel_days"] = int(prop.get("free_cancel_days") or 0)
+	prop["deposit_pct"] = float(prop.get("deposit_pct") or 0)
+	prop["sell_message"] = prop.get("sell_message") or ""
+	# drives the dial-code prefix on guest phone inputs
+	prop["country"] = prop.get("country") or "India"
+	return prop
 
 
 @frappe.whitelist()
@@ -3076,15 +3396,38 @@ def create_booking(property: str, room_type: str, check_in_date: str,
                    guest_category: str | None = None,
                    stay_details=None,
                    instructions=None,
-                   room: str | None = None):
+                   room: str | None = None,
+                   status: str | None = None,
+                   idempotency_key: str | None = None,
+                   hold_expires_on: str | None = None):
 	"""One-call booking: attach to an existing guest profile when given,
 	else dedup by phone / create one. Optional auto room assignment,
 	voucher applied, price computed by the engine.
 
 	waitlist=1 parks the stay with no room and status Waitlist - for dates
-	that are sold out or restricted; promote it later when a room frees."""
+	that are sold out or restricted; promote it later when a room frees.
+
+	status / idempotency_key / hold_expires_on support Instant public booking
+	(ADR-006 / ADR-007). Desk callers leave them unset → Confirmed."""
 	from kamra.crs import assert_property_access
+	from kamra.reservation_state import find_by_idempotency, lock_sius_for_booking
 	assert_property_access(property)
+
+	key = (idempotency_key or "").strip() or None
+	if key:
+		existing = find_by_idempotency(property, key)
+		if existing:
+			doc = frappe.get_doc("Reservation", existing)
+			return {
+				"reservation": doc.name,
+				"room": doc.room,
+				"guest": doc.guest,
+				"amount_after_tax": doc.amount_after_tax,
+				"discount": doc.discount_amount,
+				"status": doc.status,
+				"idempotent_replay": 1,
+			}
+
 	if guest:
 		if not frappe.db.exists("Guest", guest):
 			frappe.throw(f"Guest profile {guest} not found.")
@@ -3105,10 +3448,15 @@ def create_booking(property: str, room_type: str, check_in_date: str,
 		).name
 
 	if not room and int(assign_room) and not int(waitlist or 0):
+		# Serialize hybrid / SIU capacity before reading free rooms (ADR-007).
+		lock_sius_for_booking(property, room_type)
 		# a group pickup books against its own block, not general inventory
 		free = available_rooms(property, room_type, check_in_date,
 		                       check_out_date, group_booking=group_booking)
-		room = free[0].name if free else None
+		# SIU path returns plain dicts; legacy SQL returns frappe._dict.
+		room = free[0]["name"] if free else None
+	elif not int(waitlist or 0):
+		lock_sius_for_booking(property, room_type)
 
 	doc = frappe.get_doc({
 		"doctype": "Reservation",
@@ -3135,9 +3483,13 @@ def create_booking(property: str, room_type: str, check_in_date: str,
 		"contact_preference": contact_preference
 			or ("Booker" if booked_by_name else "Guest"),
 		"auto_price": 1,
+		"idempotency_key": key,
+		"hold_expires_on": hold_expires_on or None,
 	})
 	if int(waitlist or 0):
 		doc.status = "Waitlist"
+	elif status:
+		doc.status = status
 
 	# extras chosen at booking - priced from the Experience, posted to the
 	# folio the moment it opens
@@ -3246,7 +3598,7 @@ def promote_waitlist(reservation: str):
 	                       doc.check_in_date, doc.check_out_date)
 	if not free:
 		frappe.throw("Still no room free for those dates.")
-	doc.room = free[0].name
+	doc.room = free[0]["name"]
 	doc.status = "Confirmed"
 	doc.save()
 	from kamra.savings import log_action
@@ -3288,8 +3640,6 @@ def create_group_booking(property: str, group_name: str, check_in_date: str,
                          rate_plan: str | None = None):
 	"""Create a Group Booking plus one reservation per requested room.
 	`rooms` = [{"room_type": <name>, "count": 2}, ...] (JSON string ok)."""
-	import json
-
 	if isinstance(rooms, str):
 		rooms = json.loads(rooms)
 
@@ -3404,7 +3754,8 @@ def available_rooms(property: str, room_type: str, check_in_date: str,
 	                   for_group=group_booking)
 	if hold:
 		rooms = rooms[:max(0, len(rooms) - hold)]
-	return rooms
+	# Always frappe._dict so callers can use row["name"] or row.name.
+	return [frappe._dict(r) for r in (rooms or [])]
 
 
 def _available_rooms_raw(property: str, room_type: str, check_in_date: str,
@@ -3508,37 +3859,77 @@ def release_room_block(name: str):
 @require_roles("Finance", "Front Desk", "Revenue Manager", "Housekeeping")
 def cashier_pin_status(property: str):
 	"""Does this property demand a PIN on money actions, and does the
-	signed-in user have one set yet?"""
-	return {
-		"required": bool(frappe.db.get_value(
-			"Property", property, "require_cashier_pin")),
-		"has_pin": bool(frappe.db.exists("Cashier PIN", frappe.session.user)),
-	}
+	signed-in user have one set yet? Includes unlock / lockout state."""
+	from kamra.authz import cashier_unlock_status
+	return cashier_unlock_status(property)
 
 
 @frappe.whitelist(methods=["POST"])
 @require_roles("Finance", "Front Desk", "Revenue Manager", "Housekeeping")
 def set_cashier_pin(pin: str, current_pin: str | None = None):
 	"""Set or change your own cashier PIN (4-8 digits). Changing an existing
-	PIN needs the current one."""
+	PIN needs the current one — unless must_reset was set by an admin."""
 	pin = str(pin or "").strip()
 	if not pin.isdigit() or not (4 <= len(pin) <= 8):
 		frappe.throw("The PIN must be 4 to 8 digits.")
 	user = frappe.session.user
 	if frappe.db.exists("Cashier PIN", user):
-		from frappe.utils.password import get_decrypted_password
-		stored = get_decrypted_password("Cashier PIN", user, "pin",
-		                                raise_exception=False)
-		if not current_pin or str(current_pin).strip() != str(stored):
-			frappe.throw("Your current PIN is needed to change it.")
 		doc = frappe.get_doc("Cashier PIN", user)
+		if not doc.get("must_reset"):
+			from frappe.utils.password import get_decrypted_password
+			stored = get_decrypted_password("Cashier PIN", user, "pin",
+			                                raise_exception=False)
+			if not current_pin or str(current_pin).strip() != str(stored):
+				frappe.throw("Your current PIN is needed to change it.")
 		doc.pin = pin
+		doc.must_reset = 0
+		doc.pin_attempts = 0
+		doc.locked_until = None
 		doc.save(ignore_permissions=True)
 	else:
 		frappe.get_doc({"doctype": "Cashier PIN", "user": user,
-		                "pin": pin}).insert(ignore_permissions=True)
+		                "pin": pin, "must_reset": 0}).insert(
+			ignore_permissions=True)
+	frappe.cache.delete_value(f"kamra_cashier_unlock:{user}")
 	frappe.db.commit()  # nosemgrep: frappe-manual-commit -- persists the completed operation before returning to an external/public caller; reviewed as intentional
 	return {"ok": True}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Hotel Admin")
+def reset_cashier_pin(user: str):
+	"""Admin reset: wipe the user's PIN and force re-enrollment."""
+	if not user:
+		frappe.throw("user is required.")
+	if frappe.db.exists("Cashier PIN", user):
+		frappe.delete_doc("Cashier PIN", user, ignore_permissions=True,
+		                  force=True)
+	# Leave a must_reset stub so status can surface the flag, OR just
+	# rely on PIN_NOT_SET. Create a stub with must_reset for clarity.
+	frappe.get_doc({
+		"doctype": "Cashier PIN",
+		"user": user,
+		"pin": "0000",  # replaced on enroll; blocked by must_reset
+		"must_reset": 1,
+		"pin_attempts": 0,
+	}).insert(ignore_permissions=True)
+	frappe.cache.delete_value(f"kamra_cashier_unlock:{user}")
+	try:
+		from kamra.savings import log_action
+		log_action("reset_cashier_pin", "Cashier PIN", user, None,
+		           rationale=f"PIN reset for {user} by {frappe.session.user}")
+	except Exception:
+		pass
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit -- persists the completed operation before returning to an external/public caller; reviewed as intentional
+	return {"ok": True, "user": user, "must_reset": True}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Finance", "Front Desk", "Revenue Manager", "Housekeeping")
+def verify_cashier_pin(property: str, pin: str):
+	"""PinPad unlock: validate PIN and open a 15-minute sliding window."""
+	from kamra.authz import unlock_cashier_session
+	return unlock_cashier_session(property, pin)
 
 
 # ---------------------------------------------------------------------------

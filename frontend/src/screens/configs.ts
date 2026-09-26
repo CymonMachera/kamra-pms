@@ -3,6 +3,7 @@ import BillingRulesEditor from "../components/BillingRulesEditor"
 import EventLinks from "../components/EventLinks"
 import GroupControl from "../components/GroupControl"
 import RoomTypeMedia from "../components/RoomTypeMedia"
+import { HkTaskMediaPanel } from "../components/HkMedia"
 import ReservationDetail from "./ReservationDetail"
 import { cur } from "../lib/money"
 
@@ -49,6 +50,7 @@ export const roomTypesConfig: ScreenConfig = {
   form: [
     { field: "room_type_name", label: "Name", type: "data", required: true },
     { field: "room_type_code", label: "Code (e.g. DLX)", type: "data", required: true },
+    { field: "listing_slug", label: "Public listing URL slug (/stay/…)", type: "data" },
     { field: "room_category", label: "Category", type: "select", options: ["Villa", "Private", "Shared"] },
     { field: "base_price", label: "Base price / night", type: "currency", required: true },
     { field: "base_occupancy", label: "Adults included in base price", type: "int" },
@@ -62,6 +64,12 @@ export const roomTypesConfig: ScreenConfig = {
     { field: "air_conditioning", label: "Air Conditioning", type: "select", options: ["AC", "Non AC"], dependsOn: (d) => d.room_category !== "Villa" },
     // { field: "bathroom", label: "Bathroom Type", type: "select", options: ["Attached", "Common"], dependsOn: (d) => d.room_category !== "Villa" },
     // { field: "kitchen", label: "Kitchen Access", type: "check", dependsOn: (d) => d.room_category !== "Villa" },
+    { field: "location_name", label: "Villa/site name (only if different from property)", type: "data" },
+    { field: "location_slug", label: "Site URL slug (/stay/… for all listings here)", type: "data" },
+    { field: "location_address", label: "Site address", type: "data" },
+    { field: "google_maps_url", label: "Google Maps link", type: "data" },
+    { field: "latitude", label: "Latitude", type: "float" },
+    { field: "longitude", label: "Longitude", type: "float" },
     { field: "disabled", label: "Disabled", type: "check" },
   ],
   extra: RoomTypeMedia,
@@ -484,6 +492,7 @@ export const housekeepingConfig: ScreenConfig = {
     { field: "status", label: "Status", type: "select", options: ["Pending", "In Progress", "Done", "Verified"] },
     { field: "notes", label: "Notes", type: "data" },
   ],
+  extra: HkTaskMediaPanel,
 }
 
 export const billingConfig: ScreenConfig = {

@@ -17,18 +17,20 @@ import {
   Building2,
   CalendarDays,
   CalendarRange,
+  ClipboardCheck,
   ClipboardList,
   Clock,
   Code2,
   ExternalLink,
   FileSpreadsheet,
+  HeartPulse,
   Home,
   IndianRupee,
   Landmark,
   LayoutGrid,
   ListChecks,
+  ListTodo,
   PackageSearch,
-  PartyPopper,
   Plus,
   Receipt,
   ScrollText,
@@ -39,13 +41,12 @@ import {
   Store,
   Tags,
   Ticket,
+  TrendingUp,
   UserCog,
   Users,
   UtensilsCrossed,
   ConciergeBell,
-  Brush,
-  Wrench,
-  TrendingUp,
+  BarChart3,
   ChartLine,
   ShieldCheck,
   Globe,
@@ -55,21 +56,33 @@ import {
   Lock,
   AlarmClock,
   LayoutDashboard,
+  Wallet,
+  BookOpen,
+  History,
+  Banknote,
+  Calculator,
 } from "lucide-react"
+
+/** Shared tile treatment for switcher and launcher. One quiet system, not a rainbow. */
+export const APP_TILE =
+  "border border-zinc-200 bg-zinc-50 text-zinc-700"
 
 export interface AppNavItem {
   to?: string
   href?: string // external (Frappe Desk, HK mobile app) - opens a new tab
   label: string
-  icon: React.ComponentType<{ className?: string }>
+  icon: React.ComponentType<{ className?: string; strokeWidth?: number }>
   roles?: string[] // per-item gate on top of the app's gate
+  /** Sidebar section label within an app (e.g. Cashier / Billing / Books). */
+  group?: string
 }
 
 export interface AppDef {
   id: string
   name: string
-  icon: React.ComponentType<{ className?: string }>
-  tint: string // tile accent classes for switcher/launcher
+  icon: React.ComponentType<{ className?: string; strokeWidth?: number }>
+  /** @deprecated kept for callers; all apps share APP_TILE */
+  tint: string
   description: string
   roles: string[] // any of these roles can see the app
   items: AppNavItem[]
@@ -83,8 +96,8 @@ export const APPS: AppDef[] = [
   {
     id: "front-desk",
     name: "Front Desk",
-    icon: ConciergeBell,
-    tint: "bg-brand-50 text-brand-700",
+    icon: Building2,
+    tint: APP_TILE,
     description: "Arrivals, departures, bookings and guests - the day's work.",
     roles: ["Front Desk", "Hotel Admin", "System Manager", "Administrator"],
     items: [
@@ -103,8 +116,8 @@ export const APPS: AppDef[] = [
   {
     id: "housekeeping",
     name: "Housekeeping",
-    icon: Brush,
-    tint: "bg-emerald-50 text-emerald-700",
+    icon: ClipboardCheck,
+    tint: APP_TILE,
     description: "Room status board, lost & found, and the phone app.",
     roles: ["Housekeeping", "Front Desk", "Hotel Admin", "System Manager", "Administrator"],
     items: [
@@ -117,9 +130,9 @@ export const APPS: AppDef[] = [
   {
     id: "operations",
     name: "Operations",
-    icon: Wrench,
-    tint: "bg-sky-50 text-sky-700",
-    description: "Guest requests and shift handovers.",
+    icon: ListTodo,
+    tint: APP_TILE,
+    description: "Guest requests and ops workflows.",
     roles: ["Front Desk", "Hotel Admin", "System Manager", "Administrator"],
     items: [
       { to: "/tickets", label: "Guest Requests", icon: Ticket },
@@ -127,18 +140,18 @@ export const APPS: AppDef[] = [
       { to: "/channels", label: "Channels", icon: PhoneCall,
         roles: ["Hotel Admin", "System Manager", "Administrator"] },
       { to: "/ops-sla", label: "SLA Report", icon: AlarmClock },
-      { to: "/shifts", label: "Shifts", icon: Clock },
     ],
   },
   {
     id: "fnb",
     name: "F&B",
     icon: UtensilsCrossed,
-    tint: "bg-orange-50 text-orange-700",
+    tint: APP_TILE,
     description: "Restaurant POS, kitchen display, the menu and kitchen stock.",
     roles: ["Front Desk", "Finance", "Hotel Admin", "System Manager", "Administrator"],
     items: [
       { to: "/pos", label: "Restaurant POS", icon: UtensilsCrossed },
+      { to: "/pos-dashboard", label: "F&B Dashboard", icon: TrendingUp },
       { to: "/kitchen", label: "Kitchen Display", icon: ConciergeBell },
       { to: "/menu-items", label: "Menu", icon: ClipboardList },
       { to: "/inventory", label: "Kitchen Inventory", icon: PackageSearch },
@@ -148,13 +161,13 @@ export const APPS: AppDef[] = [
   {
     id: "events",
     name: "Banquets & Groups",
-    icon: PartyPopper,
-    tint: "bg-violet-50 text-violet-700",
+    icon: CalendarRange,
+    tint: APP_TILE,
     description:
       "Function prospecting, quotations and event orders - plus room blocks and pickup.",
     roles: ["Front Desk", "Revenue Manager", "Hotel Admin", "System Manager", "Administrator"],
     items: [
-      { to: "/banquet", label: "Banquets", icon: PartyPopper },
+      { to: "/banquet", label: "Banquets", icon: CalendarRange },
       { to: "/banquet-month", label: "Month Availability", icon: CalendarRange },
       { to: "/banquet-diary", label: "Function Diary", icon: CalendarDays },
       { to: "/banquet-registers", label: "Registers", icon: ScrollText },
@@ -168,8 +181,8 @@ export const APPS: AppDef[] = [
   {
     id: "revenue",
     name: "Revenue",
-    icon: TrendingUp,
-    tint: "bg-amber-50 text-amber-700",
+    icon: BarChart3,
+    tint: APP_TILE,
     description: "Rates, seasons, offers and the partners who sell you.",
     roles: ["Revenue Manager", "Hotel Admin", "System Manager", "Administrator"],
     items: [
@@ -188,23 +201,36 @@ export const APPS: AppDef[] = [
   {
     id: "finance",
     name: "Finance",
-    icon: Receipt,
-    tint: "bg-teal-50 text-teal-700",
-    description: "Folios, invoices, the night audit and reports.",
-    roles: ["Finance", "Hotel Admin", "System Manager", "Administrator"],
-    items: [
-      { to: "/billing", label: "Billing", icon: Receipt },
-      { to: "/reports", label: "Reports", icon: IndianRupee },
-      { to: "/accounting-export", label: "Accounting Export", icon: FileSpreadsheet },
-      { to: "/laundry", label: "Laundry", icon: Shirt },
+    icon: Landmark,
+    tint: APP_TILE,
+    description: "Cashier till, folios, ledgers, night audit and books export.",
+    roles: [
+      "Finance", "Front Desk", "Hotel Admin", "System Manager", "Administrator",
     ],
-    extraPrefixes: ["/billing/"],
+    items: [
+      // Cashier
+      { to: "/cashier", label: "My Till", icon: Wallet, group: "Cashier" },
+      { to: "/cashier/sessions", label: "Sessions", icon: Clock, group: "Cashier" },
+      { to: "/cashier/petty-cash", label: "Petty Cash", icon: Banknote, group: "Cashier" },
+      { to: "/cashier/shift-report", label: "Shift Report", icon: ScrollText, group: "Cashier" },
+      { to: "/shifts", label: "Shift Handover", icon: Clock, group: "Cashier" },
+      { to: "/cashier/fx", label: "Currency Desk", icon: Calculator, group: "Cashier" },
+      // Billing
+      { to: "/billing", label: "Billing", icon: Receipt, group: "Billing" },
+      { to: "/folio-history", label: "Folio History", icon: History, group: "Billing" },
+      { to: "/laundry", label: "Laundry", icon: Shirt, group: "Billing" },
+      // Books
+      { to: "/ledgers", label: "Ledgers", icon: BookOpen, group: "Books" },
+      { to: "/reports", label: "Reports", icon: IndianRupee, group: "Books" },
+      { to: "/accounting-export", label: "Accounting Export", icon: FileSpreadsheet, group: "Books" },
+    ],
+    extraPrefixes: ["/billing/", "/cashier/", "/ledgers", "/folio-history"],
   },
   {
     id: "booking-engine",
     name: "Booking Engine",
     icon: Globe,
-    tint: "bg-indigo-50 text-indigo-700",
+    tint: APP_TILE,
     description: "Manage direct booking setup, property profile, photo gallery, FAQs, and SEO rules.",
     roles: ["Revenue Manager", "Hotel Admin", "System Manager", "Administrator"],
     items: [
@@ -222,11 +248,12 @@ export const APPS: AppDef[] = [
     id: "admin",
     name: "Admin",
     icon: SettingsIcon,
-    tint: "bg-zinc-100 text-zinc-700",
+    tint: APP_TILE,
     description: "Property setup, inventory, users, audit and the Marketplace.",
     roles: ["Hotel Admin", "System Manager", "Administrator"],
     items: [
       { to: "/settings", label: "Settings", icon: SettingsIcon },
+      { to: "/health", label: "System Health", icon: HeartPulse },
       { to: "/rooms", label: "Rooms", icon: BedDouble },
       { to: "/room-types", label: "Room Types", icon: LayoutGrid },
       { to: "/activity", label: "Activity Log", icon: ScrollText },

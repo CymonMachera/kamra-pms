@@ -11,11 +11,13 @@ import {
 import AppShell, { type ShellContext } from "./AppShell"
 const Login = lazy(() => import("./screens/Login"))
 import { useAuth } from "./lib/auth"
+import { t, useT } from "./lib/i18n"
 import { toFullPath } from "./lib/routing"
 import { CalendarView } from "./components/CalendarView"
 import { ResourceScreen } from "./components/ResourceScreen"
 const Billing = lazy(() => import("./screens/Billing"))
 const PublicBooking = lazy(() => import("./screens/PublicBooking"))
+const PublicListing = lazy(() => import("./screens/PublicListing"))
 const PublicCheckin = lazy(() => import("./screens/PublicCheckin"))
 const FolioView = lazy(() => import("./screens/FolioView"))
 const GuestJourney = lazy(() => import("./screens/GuestJourney"))
@@ -25,6 +27,7 @@ const RegistrationCard = lazy(() => import("./screens/RegistrationCard"))
 const CancellationLetter = lazy(() => import("./screens/CancellationLetter"))
 const Setup = lazy(() => import("./screens/Setup"))
 const Settings = lazy(() => import("./screens/Settings"))
+const SystemHealth = lazy(() => import("./screens/SystemHealth"))
 const BookingEngine = lazy(() => import("./screens/BookingEngine"))
 const Developers = lazy(() => import("./screens/Developers"))
 const Banquet = lazy(() => import("./screens/Banquet"))
@@ -45,6 +48,7 @@ const Dashboard = lazy(() => import("./screens/Dashboard"))
 const CRS = lazy(() => import("./screens/CRS"))
 const POS = lazy(() => import("./screens/POS"))
 const Kitchen = lazy(() => import("./screens/Kitchen"))
+const PosDashboard = lazy(() => import("./screens/PosDashboard"))
 const Inventory = lazy(() => import("./screens/Inventory"))
 const QrMenu = lazy(() => import("./screens/QrMenu"))
 const AccountingExport = lazy(() => import("./screens/AccountingExport"))
@@ -54,6 +58,13 @@ const Laundry = lazy(() => import("./screens/Laundry"))
 const MenuItems = lazy(() => import("./screens/MenuItems"))
 const Today = lazy(() => import("./screens/Today"))
 const WhatsAppChat = lazy(() => import("./screens/WhatsAppChat"))
+const CashierTill = lazy(() => import("./screens/CashierTill"))
+const CashierSessions = lazy(() => import("./screens/CashierSessions"))
+const PettyCash = lazy(() => import("./screens/PettyCash"))
+const CashierShiftReport = lazy(() => import("./screens/CashierShiftReport"))
+const Ledgers = lazy(() => import("./screens/Ledgers"))
+const FolioHistory = lazy(() => import("./screens/FolioHistory"))
+const CurrencyDesk = lazy(() => import("./screens/CurrencyDesk"))
 import {
   companiesConfig,
   guardrailsConfig,
@@ -113,7 +124,8 @@ class ErrorBoundary extends Component<
 }
 
 function Splash() {
-  return <p className="py-20 text-center text-sm text-zinc-400">Loading…</p>
+  const { t } = useT()
+  return <p className="py-20 text-center text-sm text-zinc-400">{t("Loading…")}</p>
 }
 
 /** Gate for the app shell: redirects to /login (remembering where you were)
@@ -185,6 +197,11 @@ export default function App() {
           path="book/:checkin/:checkout?/:adults?/:children?"
           element={<PublicBooking />}
         />
+        <Route path="stay/:slug" element={<PublicListing />} />
+        <Route
+          path="stay/:slug/:checkin/:checkout?/:adults?/:children?"
+          element={<PublicListing />}
+        />
         {/* pre-arrival self check-in, tokenized per reservation */}
         <Route path="checkin/:token" element={<PublicCheckin />} />
         {/* housekeeping phone app - share the /hk URL with the HK team */}
@@ -244,6 +261,13 @@ export default function App() {
           />
           <Route path="billing" element={<Billing />} />
           <Route path="billing/:name" element={<FolioView />} />
+          <Route path="cashier" element={<CashierTill />} />
+          <Route path="cashier/sessions" element={<CashierSessions />} />
+          <Route path="cashier/petty-cash" element={<PettyCash />} />
+          <Route path="cashier/shift-report" element={<CashierShiftReport />} />
+          <Route path="cashier/fx" element={<CurrencyDesk />} />
+          <Route path="ledgers" element={<Ledgers />} />
+          <Route path="folio-history" element={<FolioHistory />} />
           <Route
             path="companies"
             element={<ResourceScreen config={companiesConfig} />}
@@ -289,6 +313,7 @@ export default function App() {
           />
           <Route path="setup" element={<Setup />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="health" element={<SystemHealth />} />
           <Route path="booking-settings" element={<BookingEngine />} />
           <Route path="booking-settings/:section" element={<BookingEngine />} />
           <Route path="developers" element={<Developers />} />
@@ -311,6 +336,7 @@ export default function App() {
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="crs" element={<CRS />} />
           <Route path="pos" element={<POS />} />
+          <Route path="pos-dashboard" element={<PosDashboard />} />
           <Route path="kitchen" element={<Kitchen />} />
           <Route path="inventory" element={<Inventory />} />
           <Route path="menu-items" element={<MenuItems />} />
@@ -326,7 +352,7 @@ export default function App() {
             path="*"
             element={
               <p className="py-10 text-center text-sm text-zinc-400">
-                Page not found.
+                {t("Page not found.")}
               </p>
             }
           />

@@ -11,6 +11,7 @@ import json
 
 import frappe
 from kamra.authz import require_roles
+from kamra.llm_compat import chat_payload, retry_chat_payload
 import requests
 from frappe.utils import nowdate
 
@@ -61,9 +62,19 @@ EXTRA_TOOLS = {
 		 "check_out_date": {"type": "string"}}, False, True),
 	"move_room": (
 		"move_reservation",
-		"Move a stay to a different room.",
+		"Move OR upgrade a stay to a different room - a same-type swap, or a "
+		"different type (upgrade/downgrade, e.g. Standard -> Suite). The stay's "
+		"room type follows the room it moves into. Call movable_rooms first to "
+		"pick a room that is free for the dates.",
 		{"reservation": {"type": "string"}, "new_room": {"type": "string"}},
 		False, True),
+	"movable_rooms": (
+		"movable_rooms",
+		"Rooms this stay could move into - across ALL room types - each flagged "
+		"free or occupied for its dates, with the type name. Use this before "
+		"move_room to choose a valid, available room (including upgrades).",
+		{"reservation": {"type": "string"}, "check_in_date": {"type": "string"},
+		 "check_out_date": {"type": "string"}}, False, False),
 	"stay_folios": (
 		"reservation_folios",
 		"All folios of a stay (guest/extra/company/group) with balances.",
@@ -115,6 +126,28 @@ EXTRA_TOOLS = {
 		 "priority": {"type": "string"}, "room": {"type": "string"},
 		 "reservation": {"type": "string"}, "description": {"type": "string"}},
 		True, True),
+	"advance_ticket": (
+		"advance_ticket",
+		"Move a service ticket: In Progress, Resolved, Closed, or Cancelled. "
+		"Pass resolution_note when resolving.",
+		{"ticket": {"type": "string"}, "status": {"type": "string"},
+		 "resolution_note": {"type": "string"}}, False, True),
+	"hk_queue": (
+		"hk_queue",
+		"Housekeeping task queue and room board for this property.",
+		{}, True, False),
+	"hk_update_task": (
+		"hk_update_task",
+		"Start or complete a housekeeping task (In Progress, Done, Verified).",
+		{"task": {"type": "string"}, "status": {"type": "string"}}, False, True),
+	"set_room_hk_status": (
+		"set_housekeeping_status",
+		"Set a room's housekeeping status: Clean, Dirty, Inspected, Ready, Out of Order.",
+		{"room": {"type": "string"}, "status": {"type": "string"}}, False, True),
+	"close_folio": (
+		"close_folio",
+		"Close / settle an open folio and issue the invoice. Balance must be zero. Confirm first.",
+		{"folio": {"type": "string"}}, False, True),
 	"set_room_rate": (
 		"set_room_rate",
 		"Set a nightly rate for a room type over dates. Owner guardrails apply - give a reason.",
@@ -387,7 +420,130 @@ def assistant_status(property: str):
 	return {
 		"enabled": bool(s and s.enabled and key),
 		"model": (s.model if s else None) or "gpt-4o-mini",
+		"base_url": (s.base_url if s else None) or "https://api.openai.com/v1",
 		"key_hint": key_hint,
+	}
+
+
+# Presets for Settings → AI assistant. All speak OpenAI Chat Completions.
+# Claude Desktop is a different path (MCP) — not an Anthropic key here.
+AI_PROVIDER_PRESETS = (
+	{
+		"id": "openai",
+		"label": "OpenAI",
+		"base_url": "https://api.openai.com/v1",
+		"model": "gpt-4o-mini",
+		"hint": "Paste an sk-… key from platform.openai.com",
+	},
+	{
+		"id": "gemini",
+		"label": "Google Gemini",
+		"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+		"model": "gemini-2.0-flash",
+		"hint": "Paste a Google AI Studio key — uses Gemini's OpenAI-compatible URL",
+	},
+	{
+		"id": "groq",
+		"label": "Groq",
+		"base_url": "https://api.groq.com/openai/v1",
+		"model": "llama-3.3-70b-versatile",
+		"hint": "Fast open models — key from console.groq.com",
+	},
+	{
+		"id": "openrouter",
+		"label": "OpenRouter",
+		"base_url": "https://openrouter.ai/api/v1",
+		"model": "openai/gpt-4o-mini",
+		"hint": "One key for many models (including Claude-as-model). Not Claude Desktop MCP.",
+	},
+	{
+		"id": "ollama",
+		"label": "Ollama (local)",
+		"base_url": "http://host.docker.internal:11434/v1",
+		"model": "llama3.2",
+		"hint": "Local models. From Docker use host.docker.internal; on bare metal use http://127.0.0.1:11434/v1",
+	},
+	{
+		"id": "azure",
+		"label": "Azure OpenAI",
+		"base_url": "",
+		"model": "gpt-4o-mini",
+		"hint": "Paste your Azure resource Chat Completions URL ending in /v1 (or /openai/v1)",
+	},
+	{
+		"id": "custom",
+		"label": "Custom (OpenAI-compatible)",
+		"base_url": "",
+		"model": "gpt-4o-mini",
+		"hint": "Any host that implements POST /v1/chat/completions",
+	},
+)
+
+
+@frappe.whitelist()
+@require_roles("Hotel Admin", "System Manager", "Front Desk")
+def provider_presets():
+	"""Dropdown options for Settings — kill 'paste Claude key into OpenAI' tickets."""
+	return {"presets": list(AI_PROVIDER_PRESETS)}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Hotel Admin", "System Manager")
+def test_connection(property: str, base_url: str | None = None,
+                    model: str | None = None, api_key: str | None = None):
+	"""One cheap Chat Completions call with no tools. Returns the provider
+	error text when it fails so Setup is diagnosable."""
+	import time
+
+	s = _settings(property)
+	key = (api_key or "").strip() or (
+		s.get_password("api_key", raise_exception=False) if s else None)
+	if not key:
+		frappe.throw("No API key — paste one, or save Settings first.")
+	if key.lower().startswith("sk-ant-"):
+		frappe.throw(
+			"That looks like an Anthropic / Claude API key. This chat uses "
+			"OpenAI-compatible Chat Completions only. Use Connect Claude "
+			"(MCP) on Kamra Agent, or put Claude behind OpenRouter.")
+
+	base = (base_url or (s.base_url if s else None)
+	        or "https://api.openai.com/v1").rstrip("/")
+	mdl = model or (s.model if s else None) or "gpt-4o-mini"
+	headers = {"Authorization": f"Bearer {key}",
+	           "Content-Type": "application/json"}
+	body = chat_payload(
+		mdl,
+		[{"role": "user", "content": "Reply with exactly: ok"}],
+		temperature=0,
+	)
+	# No tools — simplest possible probe.
+	t0 = time.monotonic()
+	try:
+		resp = requests.post(f"{base}/chat/completions", headers=headers,
+		                     json=body, timeout=30)
+	except requests.RequestException as e:
+		return {"ok": False, "error": f"Could not reach {base}: {e}",
+		        "base_url": base, "model": mdl}
+	ms = int((time.monotonic() - t0) * 1000)
+	if resp.status_code != 200:
+		return {
+			"ok": False,
+			"status": resp.status_code,
+			"error": (resp.text or "")[:400],
+			"base_url": base,
+			"model": mdl,
+			"latency_ms": ms,
+		}
+	try:
+		text = (resp.json()["choices"][0]["message"].get("content") or "")
+	except (KeyError, IndexError, ValueError, TypeError):
+		text = (resp.text or "")[:200]
+	return {
+		"ok": True,
+		"reply": text[:200],
+		"base_url": base,
+		"model": mdl,
+		"latency_ms": ms,
 	}
 
 
@@ -430,6 +586,25 @@ def _tool_defs():
 		},
 	} for name, (_, desc, params, _inject, _mut) in TOOLS.items()
 	  if _tool_allowed(name)]
+
+
+def _post_chat(base: str, headers: dict, body: dict, *, stream: bool = False):
+	"""POST /chat/completions, retrying once if the model rejects the payload.
+
+	GPT-5.6 luna/terra/sol refuse function tools on Chat Completions unless
+	``reasoning_effort`` is ``none`` (#23). Compatible hosts that already
+	accept the first body are unchanged.
+	"""
+	url = f"{base}/chat/completions"
+	resp = requests.post(url, headers=headers, json=body,
+	                     timeout=TIMEOUT, stream=stream)
+	if resp.status_code != 400:
+		return resp
+	retry = retry_chat_payload(body, resp.text or "")
+	if not retry:
+		return resp
+	return requests.post(url, headers=headers, json=retry,
+	                     timeout=TIMEOUT, stream=stream)
 
 
 def _run_tool(name: str, args: dict, property: str):
@@ -482,16 +657,14 @@ def ask(property: str, messages):
 		extra=("\n" + s.extra_instructions) if s.extra_instructions else "")
 	convo = [{"role": "system", "content": system}] + list(messages)
 
+	base = (s.base_url or "https://api.openai.com/v1").rstrip("/")
+	model = s.model or "gpt-4o-mini"
+	headers = {"Authorization": f"Bearer {api_key}",
+	           "Content-Type": "application/json"}
 	actions = []
 	for _ in range(MAX_TOOL_ROUNDS):
-		resp = requests.post(
-			f"{(s.base_url or 'https://api.openai.com/v1').rstrip('/')}/chat/completions",
-			headers={"Authorization": f"Bearer {api_key}",
-			         "Content-Type": "application/json"},
-			json={"model": s.model or "gpt-4o-mini", "messages": convo,
-			      "tools": _tool_defs(), "temperature": 0.2},
-			timeout=TIMEOUT,
-		)
+		resp = _post_chat(base, headers, chat_payload(
+			model, convo, tools=_tool_defs(), temperature=0.2))
 		if resp.status_code != 200:
 			frappe.throw(f"AI provider error ({resp.status_code}): "
 			             f"{resp.text[:300]}")
@@ -558,9 +731,8 @@ def ask_stream(property: str, messages):
 	# --- resolve tools synchronously (DB access happens here, before streaming)
 	actions = []
 	for _ in range(MAX_TOOL_ROUNDS):
-		resp = requests.post(f"{base}/chat/completions", headers=headers,
-			json={"model": model, "messages": convo, "tools": _tool_defs(),
-			      "temperature": 0.2}, timeout=TIMEOUT)
+		resp = _post_chat(base, headers, chat_payload(
+			model, convo, tools=_tool_defs(), temperature=0.2))
 		if resp.status_code != 200:
 			frappe.throw(f"AI provider error ({resp.status_code}): {resp.text[:200]}")
 		msg = resp.json()["choices"][0]["message"]
@@ -590,9 +762,8 @@ def ask_stream(property: str, messages):
 			yield sse("action", a)
 		try:
 			# final answer streamed WITHOUT tools → the model must produce text
-			r = requests.post(f"{base}/chat/completions", headers=headers,
-				json={"model": model, "messages": convo, "temperature": 0.2,
-				      "stream": True}, stream=True, timeout=TIMEOUT)
+			r = _post_chat(base, headers, chat_payload(
+				model, convo, stream=True, temperature=0.2), stream=True)
 			if r.status_code != 200:
 				yield sse("error", {"message": f"AI provider error ({r.status_code})"})
 			else:
@@ -689,9 +860,8 @@ def help_ask(property: str, messages):
 
 	def gen():
 		try:
-			r = requests.post(f"{base}/chat/completions", headers=headers,
-				json={"model": model, "messages": convo, "temperature": 0.3,
-				      "stream": True}, stream=True, timeout=TIMEOUT)
+			r = _post_chat(base, headers, chat_payload(
+				model, convo, stream=True, temperature=0.3), stream=True)
 			if r.status_code != 200:
 				yield sse("error", {"message": f"AI provider error ({r.status_code})"})
 			else:

@@ -34,12 +34,32 @@ scheduler_events = {
 		# 09:00 - send self check-in links to upcoming arrivals, for properties
 		# that turned the setting on (a plain automation, not an agent)
 		"0 9 * * *": ["kamra.prearrival.run_prearrival_outreach"],
-		# every 15 min - escalate overdue housekeeping tasks up the ladder
-		"*/15 * * * *": ["kamra.housekeeping.escalate_overdue_tasks"],
+		# every 15 min - escalate overdue housekeeping tasks up the ladder;
+		# also release expired Held / Pending Payment reservations (ADR-006)
+		"*/15 * * * *": [
+			"kamra.housekeeping.escalate_overdue_tasks",
+			"kamra.reservation_state.expire_holds",
+		],
 		# 08:30 - the banquet team's morning list: follow-ups gone quiet,
 		# tentative holds about to lapse, payments due, event orders missing
 		"30 8 * * *": ["kamra.banquet.run_banquet_reminders"],
+		# 04:15 - wipe the public demo so it cannot be used as a live PMS
+		# (no-op unless kamra_demo_mode is on and the site is a playground)
+		"15 4 * * *": ["kamra.scripts.reset_demo.scheduled"],
+		# 03:30 - storage limitation (DPDP s.8(7)): erase guests idle past
+		# their property's retention period
+		"30 3 * * *": ["kamra.privacy.apply_retention"],
+		# 04:45 - drop old kamrapms.com Hosting Enquiry leads (default 24 months;
+		# Won / converted stays; site_config hosting_enquiry_retention_months)
+		"45 4 * * *": ["kamra.hosting_enquiry_retention.purge_expired_hosting_enquiries"],
 	},
+}
+
+# DPDP Rules: keep logs of access to personal data for at least one year
+# (Frappe's own defaults are 30 and 90 days).
+default_log_clearing_doctypes = {
+	"Access Log": [365],
+	"Activity Log": [365],
 }
 
 # Apps
@@ -71,6 +91,8 @@ website_route_rules = [
 website_redirects = [
 	{"source": r"/book$", "target": "/kamra/book"},
 	{"source": r"/book/(.*)", "target": r"/kamra/book/\1"},
+	{"source": r"/stay$", "target": "/kamra/stay"},
+	{"source": r"/stay/(.*)", "target": r"/kamra/stay/\1"},
 	{"source": r"/hk$", "target": "/kamra/hk"},
 	{"source": r"/checkin/(.*)", "target": r"/kamra/checkin/\1"},
 ]
@@ -214,6 +236,17 @@ doc_events = {
 	                "Service Ticket", "Agent Action Log")
 }
 
+# A reservation booked/modified/cancelled moves availability, so fan the new
+# numbers out to the channel manager (Pipeline 1). Runs alongside the realtime
+# notify; best-effort and after-commit so it never affects the booking itself.
+doc_events["Reservation"] = {
+	"after_insert": ["kamra.realtime.notify",
+	                 "kamra.channel_manager.on_reservation_change"],
+	"on_update": ["kamra.realtime.notify",
+	              "kamra.channel_manager.on_reservation_change"],
+	"on_trash": "kamra.realtime.notify",
+}
+
 # Scheduled Tasks
 # ---------------
 
@@ -271,9 +304,14 @@ doc_events = {
 
 # ignore_links_on_delete = ["Communication", "ToDo"]
 
+# Remote MCP + OAuth live at /mcp and /mcp/oauth/* (not the SPA).
+page_renderer = ["kamra.mcp_http.MCPPageRenderer"]
+
 # Request Events
 # ----------------
-# before_request = ["kamra.utils.before_request"]
+# Preserve AioSell's Basic-auth header for the channel webhook before Frappe's
+# own api-key auth rejects it (see kamra.channels.aiosell.preserve_webhook_auth).
+before_request = ["kamra.channels.aiosell.preserve_webhook_auth"]
 # after_request = ["kamra.utils.after_request"]
 
 # Job Events

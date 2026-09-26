@@ -65,7 +65,59 @@ def open_folio(reservation) -> str:
 	_recalculate(folio)
 	folio.insert(ignore_permissions=True)
 	_post_addons(reservation, folio.name)
+	_post_cleaning_fee(reservation, folio.name)
 	return folio.name
+
+
+def _post_cleaning_fee(reservation, folio_name: str):
+	"""Post one-time cleaning fee from quote snapshot / property (ADR-008)."""
+	import json
+	amount = 0.0
+	tax_rate = 0.0
+	snap = getattr(reservation, "quote_snapshot", None)
+	if snap:
+		try:
+			data = json.loads(snap) if isinstance(snap, str) else snap
+			for li in data.get("line_items") or []:
+				if li.get("component") == "cleaning_fee":
+					amount = float(li.get("amount") or 0)
+					tax = float(li.get("tax_amount") or 0)
+					tax_rate = (tax / amount * 100) if amount else 0
+					break
+		except Exception:
+			pass  # snapshot unreadable; fall back to the property's current cleaning fee
+	if amount <= 0:
+		amount = float(
+			frappe.db.get_value(
+				"Property", reservation.property, "cleaning_fee"
+			)
+			or 0
+		)
+	if amount <= 0:
+		return
+	if frappe.db.exists(
+		"Folio Charge",
+		{"parent": folio_name, "charge_type": "Cleaning Fee", "auto_posted": 1},
+	):
+		return
+	doc = frappe.get_doc("Folio", folio_name)
+	if doc.status == "Closed":
+		return
+	doc.append(
+		"charges",
+		{
+			"posting_date": nowdate(),
+			"charge_type": "Cleaning Fee",
+			"description": "Cleaning fee",
+			"qty": 1,
+			"rate": amount,
+			"amount": amount,
+			"gst_rate": tax_rate,
+			"auto_posted": 1,
+		},
+	)
+	_recalculate(doc)
+	doc.save(ignore_permissions=True)
 
 
 def _post_addons(reservation, folio_name: str):
@@ -209,7 +261,8 @@ def _nightly_room_rate(reservation, date) -> float:
 
 	rt = frappe.get_doc("Room Type", reservation.room_type)
 	base = occupancy_rate(rt, reservation.adults, reservation.children)
-	rate = season_adjust(reservation.property, date, base)
+	rate = season_adjust(reservation.property, date, base,
+	                     reservation.room_type)
 	if rates_include_tax(reservation.property):
 		gst = room_gst_rate(reservation.property, rt, rate)
 		rate = rate / (Decimal(1) + gst / Decimal(100))
@@ -221,7 +274,8 @@ def _nightly_gst(reservation, date) -> float:
 
 	rt = frappe.get_doc("Room Type", reservation.room_type)
 	base = occupancy_rate(rt, reservation.adults, reservation.children)
-	gross = season_adjust(reservation.property, date, base)
+	gross = season_adjust(reservation.property, date, base,
+	                      reservation.room_type)
 	return float(room_gst_rate(reservation.property, rt, gross))
 
 
@@ -634,7 +688,9 @@ def run_night_audit(property: str, business_date: str | None = None) -> dict:
 	# UnboundLocalError. Default it so the audit runs everywhere.
 	if not getattr(frappe.local, "lang", None):
 		frappe.local.lang = "en"
-	business_date = business_date or nowdate()
+	from kamra.business_date import ensure_business_date, get_business_date
+	ensure_business_date(property)
+	business_date = business_date or get_business_date(property)
 	# per property AND date - a global AUDIT-<date> name would make the
 	# second property's audit silently no-op every night
 	audit_name = f"AUDIT-{business_date}-{property}"
@@ -720,6 +776,11 @@ def run_night_audit(property: str, business_date: str | None = None) -> dict:
 	})
 	audit.insert(ignore_permissions=True)
 
+	# Advance the front-office business date (Opera End of Day roll).
+	from kamra.business_date import advance_business_date, ensure_business_date
+	ensure_business_date(property)
+	new_bd = advance_business_date(property, business_date)
+
 	from kamra.savings import log_action
 	log_action(
 		action_type="night_audit",
@@ -728,7 +789,7 @@ def run_night_audit(property: str, business_date: str | None = None) -> dict:
 		property=property,
 		minutes_saved=90,
 		rationale=f"Posted {charges_posted} room nights, flagged {no_shows} "
-		          f"no-shows for {business_date}",
+		          f"no-shows for {business_date}; business date → {new_bd}",
 		agent_name="Night Audit",
 		autonomy="Full",
 		channel="API",
@@ -740,6 +801,8 @@ def run_night_audit(property: str, business_date: str | None = None) -> dict:
 		"amount_posted": float(amount_posted),
 		"no_shows_flagged": no_shows,
 		"folios_opened": folios_opened,
+		"business_date": business_date,
+		"next_business_date": new_bd,
 	}
 
 

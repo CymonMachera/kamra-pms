@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: Kamra
-  text: The open-source hotel PMS
-  tagline: Front desk, billing & GST, POS, housekeeping, direct bookings — 100% open source, AI-ready, no per-room fees. This is the manual.
+  text: The open-source PMS for hotels and villas
+  tagline: Front desk, billing & GST, POS, housekeeping, direct bookings and short-term rentals — 100% open source, AI-ready, no per-room fees. This is the manual.
   image:
     src: /kamra-mark.svg
     alt: Kamra
@@ -24,7 +24,7 @@ features:
     details: Runs on a ₹549/month VPS (2 vCPU · 4 GB). Step-by-step guides for Hostinger, DigitalOcean, Linode and AWS.
     link: /self-hosting/
   - title: Connect your AI over MCP
-    details: 32 governed tools. Claude (or any MCP client) quotes, books and posts charges as a permission-checked user, fully audited.
+    details: 85 governed tools. Click Connect Claude — it quotes, books and posts charges as a permission-checked user, fully audited.
     link: /ai-and-mcp
   - title: Everything included, always
     details: No feature gates, no editions, no per-room pricing. The same complete system whether you self-host or use Kamra Cloud.
@@ -33,14 +33,20 @@ features:
 
 ## What is Kamra?
 
-Kamra is a complete property-management system for hotels, built on
+::: tip What's new on develop
+The **2.6.2** train (GitHub tag still pending; latest published release is [v2.6.0](https://github.com/Kamra-PMS/kamra-pms/releases/tag/v2.6.0)) plus Unreleased work: cashier/finance, **85 MCP tools**, System Health, property time zone, and banquet Phase 1. Notes: [CHANGELOG](https://github.com/Kamra-PMS/kamra-pms/blob/develop/CHANGELOG.md).
+:::
+
+Kamra is a complete property-management system for hotels and short-term
+rentals, built on
 [Frappe](https://frappeframework.com) and released under AGPL-3.0:
 
 - **Front desk** — tape chart, arrivals, group bookings, room blocks, waitlists, self check-in
 - **Money** — folios with per-line GST, split/route billing, night audit, GST invoices, GSTR-1 export
 - **F&B** — restaurant POS, live kitchen display, guest QR ordering, room posting
 - **Housekeeping** — a phone app for floor staff with task assignment, SLA escalation, lost & found
-- **Direct bookings** — a public booking page with live rates, promo codes and experience add-ons
+- **Direct bookings** — a public booking page with live rates, check-in / check-out, and Check availability
+- **Short-term rentals** — villa catalogs, per-site maps, room-wise or entire-place selling, deposits
 - **Multi-property** — one login, shared guest profiles, central reservations, portfolio dashboard
 - **AI-native** — an MCP server and a BYO-key copilot over one governed, audited tool layer
 

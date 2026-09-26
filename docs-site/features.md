@@ -47,7 +47,12 @@ amount; route lines between Guest/Company/Group folios (alcohol can never
 reach a company folio); night audit that posts room nights idempotently
 and charges no-shows per policy; GST invoices with per-property series;
 allowances, part-settlement, invoice cancellation with a register;
-**GSTR-1 export** in Tally / Zoho Books / ERPNext formats.
+**GSTR-1 export** in Tally / Zoho Books / ERPNext formats. **Cashier** is
+Opera-style: till open/close with float and variance, unified FO+POS cash,
+petty cash, a shift report, currency desk, and a PIN pad on folio and POS
+money actions. Folios use an append-only ledger (Guest / Deposit / AR /
+Package). To run full company books (and optional HR) on the same Frappe
+site as Kamra, see [ERPNext and Frappe HR](/self-hosting/erpnext-hr).
 
 ## Your country's taxes
 
@@ -77,7 +82,8 @@ in-house guests also raise a Service Ticket on the desk queue.
 ## F&B — POS and kitchen
 
 Outlet-based restaurant POS with a photo menu, per-item instructions and
-guest discounts. The captain works from a colour-coded **table map**
+guest discounts, plus a **full-screen till and kitchen pass**. The captain
+works from a colour-coded **table map**
 (vacant / running / in kitchen / ready) and can juggle several running
 bills at once — dine-in, room service, takeaway and delivery (with the
 customer's name, phone and address carried onto the KOT and bill). A table holds **any
@@ -189,13 +195,29 @@ you say so.
 play, outstanding — with conversion, a breakdown by event type, hall
 and source, and why the business that went away went away.
 
+**Phase 1 ops.** Send the quotation by email or WhatsApp, record the
+guest's response on the desk (no guest portal), and on Confirm fan out
+department checklists — Sales, Finance, HK, F&B — plus a quote
+no-response chase.
+
 ## Direct bookings
 
 A public booking page with live availability and real quotes, photo
 galleries, policies and FAQs, promo codes, **experiences as add-ons**
 (spa, safari, dinner), configurable advance collection (percent / fixed /
 full / pay-at-hotel — terms are snapshotted per booking), your brand
-colour, and SEO baked in (schema.org hotel markup, OG images).
+colour, and SEO baked in (schema.org hotel markup, OG images). Guests
+pick **check-in and check-out** and tap **Check availability**.
+
+## Short-term rentals
+
+Kamra runs villas the same way it runs hotels. Set the property kind to
+**Short Term Rental** and the public site becomes a catalog of places —
+each villa at its own address, sold as private rooms or the whole house.
+Inventory is **sellable units** (room / whole-place / package) with
+competition groups, so booking the villa takes its rooms off sale.
+Quotes carry cleaning fees and refundable deposits. Instant book or
+request-to-book.
 
 ## Multi-property
 
@@ -225,7 +247,16 @@ one.
 
 ## AI & audit
 
-An MCP server with 32 governed tools, an in-app copilot (bring your own
-key), rate guardrails agents cannot price outside, deterministic pricing
-verified by an automated eval suite, and an activity ledger recording
-every action — human or AI — with who, what and why.
+An MCP server with 85 governed tools (filtered by user roles **and** the
+property's enabled modules), one-click Connect Claude, an in-app copilot
+with Settings presets (OpenAI, Gemini, Groq, OpenRouter, Ollama), rate
+guardrails agents cannot price outside, deterministic pricing verified by
+an automated eval suite, and an activity ledger recording every action —
+human or AI — with who, what and why.
+
+## Admin
+
+**System Health** (Admin) checks the installed version against GitHub,
+runs site diagnostics, and points at the upgrade path for self-host /
+bench / Docker — no auto-upgrade. Property **time zone** lives on Admin →
+Settings → Property and syncs the site clock on single-property sites.

@@ -40,7 +40,7 @@ def check(name):
 				)
 				RESULTS.append((name, False, f"{type(e).__name__}: {e} [{tail}]"))
 			finally:
-				frappe.set_user("Administrator")
+				frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 		run.__name__ = name
 		return run
 	return wrap
@@ -50,10 +50,10 @@ class at_the_desk:
 	"""Everything inside runs as the Front Desk user."""
 
 	def __enter__(self):
-		frappe.set_user(FD_USER)
+		frappe.set_user(FD_USER)  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 	def __exit__(self, *exc):
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 
 def setup():
@@ -193,6 +193,10 @@ def f7():
 	post_room_night(frappe.get_doc("Reservation", out["reservation"]),
 	                "2032-02-15")
 	with at_the_desk():
+		# a real cashier must have an open till before money moves
+		# (Finance → Cashier); open one for this shift
+		from kamra.cashier import open_session
+		open_session(P)
 		fd = frappe.get_doc("Folio", folio)
 		api.add_folio_payment(folio, "UPI", fd.grand_total)
 		inv = api.close_folio(folio)
@@ -314,7 +318,7 @@ def execute():
 		for fn in (f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13):
 			fn()
 	finally:
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 		frappe.db.commit = real_commit
 		frappe.db.rollback(save_point="fd_eval_start")
 

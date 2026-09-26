@@ -15,9 +15,9 @@ An optional chat assistant for staff, right inside the console.
 provider's API key, save. The sparkle button appears bottom-right for
 everyone at that property.
 
-- **Any OpenAI-compatible provider works** — OpenAI
-  (`https://api.openai.com/v1`), OpenRouter, Groq, a local Ollama/vLLM.
-  Set the base URL and model to taste.
+- **Any OpenAI-compatible provider works.** Settings presets cover
+  OpenAI, Gemini, Groq, OpenRouter, and Ollama (OpenAI-compatible base
+  URL + Test connection). Set the base URL and model to taste.
 - **Your key, your data.** Kamra adds no markup and proxies nothing
   through third parties — requests go from your server to your provider.
 - **Governed:** the model can only call Kamra's tools (quote, book,
@@ -28,33 +28,13 @@ everyone at that property.
   `copilot_<tool>` with its arguments, on top of the API's own logging.
   Filter the Agent Action Log by channel "Chat" to review a shift.
 
-## 2. MCP — connect Claude (or any MCP client)
+## 2. MCP — connect Claude
 
-The MCP server ships with the app (`mcp/kamra_mcp.py`) and exposes 25+
-tools: availability, quotes, bookings, group billing, splits, occupant
-register, GRC data, rate changes, cancellations, owner briefing, night
-audit, property setup and AI-assisted booking imports.
+The live guide is **[Connect your AI (MCP)](https://kamrapms.com/docs/ai-and-mcp)**.
+Staff click **Kamra Agent → Connect your AI → Connect Claude**. The hotel
+serves `/mcp` over HTTPS with OAuth (PKCE). No API keys on a laptop.
 
-**Get credentials** (token auth, per user — use the scoped agent
-account, not an admin):
-
-1. Desk → `Users` → `agent@kamra.local` → **API Access → Generate Keys**.
-2. Copy the API secret immediately (shown once).
-
-**Connect** (the exact command with your URL is on Settings → *Agent
-access*):
-
-```bash
-claude mcp add kamra \
-  -e KAMRA_URL=https://your-hotel.example.com \
-  -e KAMRA_API_KEY=xxxx -e KAMRA_API_SECRET=xxxx \
-  -e KAMRA_PROPERTY="Your Property" \
-  -- python apps/kamra/mcp/kamra_mcp.py
-```
-
-Then just talk: *"Book Mr. Rao a deluxe Fri–Sun with breakfast, company
-Acme pays the stay"* — the agent quotes, books, routes billing by the
-company's rules, and logs it all.
+Stdio (`mcp/kamra_mcp.py`) remains for air-gapped / localhost benches.
 
 ## Direct REST
 

@@ -19,6 +19,8 @@
   "source",
   "channel",
   "ota_ref",
+  "idempotency_key",
+  "hold_expires_on",
   "travel_agent",
   "commission_amount",
   "sb_booker",
@@ -104,7 +106,10 @@
   "cancellation_fee",
   "cancelled_on",
   "advance_due",
-  "payment_policy"
+  "payment_policy",
+  "quote_snapshot",
+  "access_released",
+  "access_released_on"
  ],
  "fields": [
   {
@@ -162,6 +167,19 @@
    "label": "OTA Booking Ref",
    "read_only": 1,
    "description": "The channel manager's booking id - modifications and cancellations match on it"
+  },
+  {
+   "description": "Caller-supplied key so duplicate public/OTA book requests return the same reservation (ADR-007).",
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "read_only": 1
+  },
+  {
+   "description": "When set, Held / Pending Payment auto-cancels after this time.",
+   "fieldname": "hold_expires_on",
+   "fieldtype": "Datetime",
+   "label": "Hold Expires On"
   },
   {
    "fieldname": "sb_stay",
@@ -572,6 +590,27 @@
    "fieldname": "payment_policy",
    "fieldtype": "Data",
    "label": "Payment Policy",
+   "read_only": 1
+  },
+  {
+   "description": "Immutable typed quote at booking (ADR-008).",
+   "fieldname": "quote_snapshot",
+   "fieldtype": "Code",
+   "label": "Quote Snapshot",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "access_released",
+   "fieldtype": "Check",
+   "label": "Access Released",
+   "read_only": 1
+  },
+  {
+   "fieldname": "access_released_on",
+   "fieldtype": "Datetime",
+   "label": "Access Released On",
    "read_only": 1
   },
   {

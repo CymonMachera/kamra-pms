@@ -4,7 +4,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import cint, date_diff, now_datetime
+from frappe.utils import cint, date_diff, formatdate, now_datetime, today
 
 
 class Reservation(Document):
@@ -31,6 +31,12 @@ class Reservation(Document):
 					"kamra.whatsapp.notify_booking_confirmed",
 					reservation=self.name, queue="short",
 					enqueue_after_commit=True)
+		# ADR-009: open deposit liability when property policy requires one.
+		try:
+			from kamra.deposit import ensure_deposit_for_reservation
+			ensure_deposit_for_reservation(self)
+		except Exception:
+			frappe.log_error(title="Security deposit ensure failed")
 
 	def validate_type_capacity(self):
 		"""Room-type capacity with a controlled overbooking allowance.
@@ -40,7 +46,11 @@ class Reservation(Document):
 		allowance (room type override, else property-wide, default 0%) is a
 		revenue-management decision made in Settings - never implicit.
 		"""
-		# waitlisted stays hold no inventory - parking is always allowed
+		# waitlisted / inquiry stays hold no inventory
+		from kamra.reservation_state import holds_inventory
+		if not holds_inventory(self.status):
+			return
+		# also skip classic non-inventory statuses not in LIVE
 		if self.status in ("Cancelled", "No Show", "Checked Out", "Waitlist"):
 			return
 		total = frappe.db.count("Room", {"room_type": self.room_type})
@@ -61,7 +71,7 @@ class Reservation(Document):
 			cnt = frappe.db.sql(
 				"""SELECT COUNT(*) FROM `tabReservation`
 				   WHERE room_type = %(rt)s AND name != %(name)s
-				     AND status IN ('Confirmed', 'Checked In')
+				     AND status IN ('Confirmed', 'Checked In', 'Held', 'Pending Payment')
 				     AND check_in_date <= %(d)s
 				     AND GREATEST(check_out_date,
 				                  DATE_ADD(check_in_date, INTERVAL 1 DAY)) > %(d)s""",
@@ -76,7 +86,10 @@ class Reservation(Document):
 
 	def validate(self):
 		self.validate_dates()
+		self.validate_past_check_in()
 		self.nights = date_diff(self.check_out_date, self.check_in_date)
+		self.validate_minimum_nights()
+		self.validate_status_transition()
 		self.validate_blacklist()
 		self.validate_occupancy()
 		self.validate_room_belongs_to_type()
@@ -86,6 +99,31 @@ class Reservation(Document):
 		self.validate_cancellation_path()
 		self.apply_pricing()
 
+	def validate_minimum_nights(self):
+		"""Property.minimum_nights is a hard floor for overnight stays."""
+		if self.status in ("Cancelled", "No Show", "Checked Out", "Inquiry", "Quoted"):
+			return
+		# day-use is nights == 0; min nights applies to overnight only
+		nights = date_diff(self.check_out_date, self.check_in_date)
+		if nights <= 0:
+			return
+		min_n = cint(frappe.db.get_value(
+			"Property", self.property, "minimum_nights") or 1)
+		if min_n > 1 and nights < min_n:
+			frappe.throw(
+				_("This property requires a stay of at least {0} nights.").format(
+					min_n),
+				title=_("Minimum stay"),
+			)
+
+	def validate_status_transition(self):
+		if self.is_new():
+			return
+		old = self.get_doc_before_save()
+		if not old:
+			return
+		from kamra.reservation_state import assert_transition
+		assert_transition(old.status, self.status)
 	def validate_cancellation_path(self):
 		"""Cancellations must go through cancel_reservation so the
 		property's cancellation policy is applied (or knowingly waived) —
@@ -139,6 +177,34 @@ class Reservation(Document):
 				frappe.throw(_("Day-use stays check out the same day."))
 		elif diff < 1:
 			frappe.throw(_("Check-out must be after check-in."))
+
+	def validate_past_check_in(self):
+		"""Check-in cannot be before calendar today for sellable stays.
+
+		- New bookings with a past check-in are rejected.
+		- Edits that *change* check-in to a past date are rejected (so desk
+		  cannot quietly backdate Confirmed / Held / Checked In stays).
+		- Saving an in-house stay without changing dates stays allowed —
+		  arrival already happened, the nights are historical.
+		- Cancelled / No Show are exempt (not inventoriable).
+		- Walk-in catch-up, seeding, and imports set flags.allow_past_check_in
+		  (or ignore_validate on history import).
+		"""
+		if self.flags.get("allow_past_check_in"):
+			return
+		if self.status in ("Cancelled", "No Show"):
+			return
+		if date_diff(today(), self.check_in_date) <= 0:
+			return
+		if not self.is_new():
+			old = self.get_doc_before_save()
+			if old and date_diff(old.check_in_date, self.check_in_date) == 0:
+				return
+		frappe.throw(
+			_("Check-in {0} has already passed. Pick today or a later date.")
+			.format(formatdate(self.check_in_date)),
+			title=_("Check-in date is in the past"),
+		)
 
 	def validate_blacklist(self):
 		if not self.guest or not self.is_new():
@@ -200,6 +266,12 @@ class Reservation(Document):
 		self.tax_amount = q["tax_amount"]
 		self.amount_after_tax = q["amount_after_tax"]
 		self.discount_amount = q["discount"]
+		# Persist immutable quote snapshot (ADR-008).
+		if hasattr(self, "quote_snapshot"):
+			import json
+			snap = dict(q)
+			snap["idempotency_key"] = getattr(self, "idempotency_key", None)
+			self.quote_snapshot = json.dumps(snap, default=str)
 		if getattr(self, "travel_agent", None):
 			pct = frappe.db.get_value(
 				"Travel Agent", self.travel_agent, "commission_pct") or 0
@@ -212,10 +284,25 @@ class Reservation(Document):
 			return
 		room_type = frappe.db.get_value("Room", self.room, "room_type")
 		if room_type != self.room_type:
+			# help the user by naming the rooms they CAN move to: rooms of the
+			# reservation's own type that are free for these dates
+			from kamra.api import _available_rooms_raw
+			free = [
+				r.room_number for r in _available_rooms_raw(
+					self.property, self.room_type,
+					self.check_in_date, self.check_out_date)
+				if r.name != self.room
+			]
+			if free:
+				hint = _(" Free {0} rooms for these dates: {1}.").format(
+					self.room_type, ", ".join(free))
+			else:
+				hint = _(" No {0} rooms are free for these dates.").format(
+					self.room_type)
 			frappe.throw(
 				_("Room {0} belongs to {1}, not {2}.").format(
 					self.room, room_type, self.room_type
-				)
+				) + hint
 			)
 
 	def validate_no_overlap(self):
@@ -225,7 +312,10 @@ class Reservation(Document):
 		on every insert/update, regardless of whether a human or an AI agent
 		created the booking.
 		"""
-		if not self.room or self.status in ("Cancelled", "No Show", "Checked Out"):
+		if not self.room or self.status in (
+			"Cancelled", "No Show", "Checked Out", "Waitlist",
+			"Inquiry", "Quoted", "Requested",
+		):
 			return
 		# serialize concurrent bookings for the same room: the row lock
 		# makes the second transaction wait, and the locking read below
@@ -239,7 +329,7 @@ class Reservation(Document):
 			SELECT name FROM `tabReservation`
 			WHERE room = %(room)s
 			  AND name != %(name)s
-			  AND status IN ('Confirmed', 'Checked In')
+			  AND status IN ('Confirmed', 'Checked In', 'Held', 'Pending Payment')
 			  AND check_in_date < GREATEST(%(check_out)s,
 			                               DATE_ADD(%(check_in)s, INTERVAL 1 DAY))
 			  AND GREATEST(check_out_date,
@@ -263,7 +353,10 @@ class Reservation(Document):
 			)
 
 	def validate_villa_lockout(self):
-		if self.status in ("Cancelled", "No Show", "Checked Out", "Waitlist") or not self.room_type:
+		if self.status in (
+			"Cancelled", "No Show", "Checked Out", "Waitlist",
+			"Inquiry", "Quoted", "Requested",
+		) or not self.room_type:
 			return
 		
 		# Get Room Category of the requested Room Type
@@ -277,7 +370,7 @@ class Reservation(Document):
 				LEFT JOIN `tabRoom Type` rt ON r.room_type = rt.name
 				WHERE r.property = %(property)s
 				  AND r.name != %(name)s
-				  AND r.status IN ('Confirmed', 'Checked In')
+				  AND r.status IN ('Confirmed', 'Checked In', 'Held', 'Pending Payment')
 				  AND (rt.room_category != 'Villa' OR rt.room_category IS NULL)
 				  AND r.check_in_date < GREATEST(%(check_out)s, DATE_ADD(%(check_in)s, INTERVAL 1 DAY))
 				  AND GREATEST(r.check_out_date, DATE_ADD(r.check_in_date, INTERVAL 1 DAY)) > %(check_in)s
@@ -305,7 +398,7 @@ class Reservation(Document):
 				LEFT JOIN `tabRoom Type` rt ON r.room_type = rt.name
 				WHERE r.property = %(property)s
 				  AND r.name != %(name)s
-				  AND r.status IN ('Confirmed', 'Checked In')
+				  AND r.status IN ('Confirmed', 'Checked In', 'Held', 'Pending Payment')
 				  AND rt.room_category = 'Villa'
 				  AND r.check_in_date < GREATEST(%(check_out)s, DATE_ADD(%(check_in)s, INTERVAL 1 DAY))
 				  AND GREATEST(r.check_out_date, DATE_ADD(r.check_in_date, INTERVAL 1 DAY)) > %(check_in)s
@@ -335,7 +428,19 @@ class Reservation(Document):
 			self.handle_check_in()
 		elif self.status == "Checked Out":
 			self.handle_check_out()
+		elif self.status == "Confirmed" and old_status in (
+			"Held", "Pending Payment", "Requested", "Waitlist",
+		):
+			self._notify_confirmed()
 
+	def _notify_confirmed(self):
+		from kamra import whatsapp
+		if whatsapp.has_connection(self.property):
+			frappe.enqueue(
+				"kamra.whatsapp.notify_booking_confirmed",
+				reservation=self.name, queue="short",
+				enqueue_after_commit=True,
+			)
 	def handle_check_in(self):
 		if not self.room:
 			frappe.throw(_("Assign a room before check-in."))

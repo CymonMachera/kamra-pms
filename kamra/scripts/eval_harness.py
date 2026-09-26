@@ -19,12 +19,18 @@ RESULTS = []
 def check(name):
 	def wrap(fn):
 		def run():
+			# Isolate each check: an OperationalError aborts the MySQL
+			# transaction and would poison later tests without a rollback.
+			sp = f"eval_{frappe.generate_hash(length=8)}"
+			frappe.db.savepoint(sp)
 			try:
 				fn()
 				RESULTS.append((name, True, ""))
 			except AssertionError as e:
+				frappe.db.rollback(save_point=sp)
 				RESULTS.append((name, False, str(e)))
 			except Exception as e:
+				frappe.db.rollback(save_point=sp)
 				import traceback
 				tail = " | ".join(
 					line.strip()
@@ -131,6 +137,45 @@ def t3():
 	assert rates == [8000, 8000, 4000], rates
 
 
+@check("a season only moves the room type it names")
+def t3b():
+	"""The villa's weekend price must never become the room's weekend
+	price. A season naming a room type leaves every other type alone;
+	one with the room type blank stays house-wide."""
+	from decimal import Decimal
+
+	from kamra.pricing import season_adjust
+
+	villa = frappe.get_doc({
+		"doctype": "Room Type", "property": P, "room_type_code": "EVV",
+		"room_type_name": "Eval Villa", "base_price": 30000,
+		"base_occupancy": 2, "adults_capacity": 4, "children_capacity": 2,
+		"tax_percent": 5,
+	}).insert(ignore_permissions=True)
+	season = frappe.get_doc({
+		"doctype": "Season", "property": P, "room_type": villa.name,
+		"season_name": "EVAL Villa Weekend",
+		"start_date": "2030-03-01", "end_date": "2030-03-31",
+		"adjustment_type": "Absolute", "adjustment_value": 36800,
+		"priority": 100,
+	}).insert(ignore_permissions=True)
+	try:
+		base = Decimal(4000)
+		priced = season_adjust(P, "2030-03-05", base, villa.name)
+		assert priced == 36800, priced
+		# the regression: the villa's season must not price the room
+		leaked = season_adjust(P, "2030-03-05", base, RT)
+		assert leaked == base, leaked
+		# nor a caller that names no room type at all
+		blanket = season_adjust(P, "2030-03-05", base)
+		assert blanket == base, blanket
+	finally:
+		frappe.delete_doc("Season", season.name, force=True,
+		                  ignore_permissions=True)
+		frappe.delete_doc("Room Type", villa.name, force=True,
+		                  ignore_permissions=True)
+
+
 @check("GST slab: 5% below threshold, 18% above")
 def t4():
 	from kamra.pricing import quote
@@ -174,13 +219,18 @@ def _guest(name, phone):
 	}).insert(ignore_permissions=True).name
 
 
-def _res(guest, ci, co, room=None, day_use=0):
-	return frappe.get_doc({
+def _res(guest, ci, co, room=None, day_use=0, allow_past=0):
+	doc = frappe.get_doc({
 		"doctype": "Reservation", "property": P, "guest": guest,
 		"room_type": RT, "room": room, "check_in_date": ci,
 		"check_out_date": co, "adults": 2, "is_day_use": day_use,
 		"auto_price": 1,
-	}).insert(ignore_permissions=True)
+	})
+	# a back-dated booking (e.g. seeding a no-show) is a legitimate case the
+	# past-check-in guard exempts via this flag
+	if allow_past:
+		doc.flags.allow_past_check_in = True
+	return doc.insert(ignore_permissions=True)
 
 
 @check("double booking blocked; adjacent stay allowed")
@@ -492,7 +542,7 @@ def t18():
 
 	# yesterday's un-arrived booking → no-show flagged AND charged
 	g3 = _guest("Eval NoShow", "+91 70000 00017")
-	ns = _res(g3, add_days(nowdate(), -1), nowdate())
+	ns = _res(g3, add_days(nowdate(), -1), nowdate(), allow_past=1)
 	run_night_audit(P, nowdate())
 	assert frappe.db.get_value("Reservation", ns.name, "status") == "No Show"
 	ns_folio = frappe.db.get_value(
@@ -500,6 +550,40 @@ def t18():
 	assert ns_folio, "no-show folio not opened"
 	charges = frappe.get_doc("Folio", ns_folio).charges
 	assert any("No-show" in (c.description or "") for c in charges)
+
+
+@check("past check-in blocked on create and on date amend; allow_past still works")
+def t18b():
+	g = _guest("Eval PastCI", "+91 70000 00018")
+	yesterday = add_days(nowdate(), -1)
+	# new booking into the past must fail
+	try:
+		_res(g, yesterday, nowdate())
+		raise AssertionError("past check-in accepted on create")
+	except frappe.ValidationError:
+		pass
+	# flag still allows catch-up / seeding
+	res = _res(g, yesterday, nowdate(), allow_past=1)
+	# saving without changing dates (in-house style) must stay ok
+	res.status = "Checked In"
+	res.save(ignore_permissions=True)
+	# moving check-in further into the past must fail
+	res.check_in_date = add_days(nowdate(), -2)
+	try:
+		res.save(ignore_permissions=True)
+		raise AssertionError("past check-in amend accepted")
+	except frappe.ValidationError:
+		pass
+	# Confirmed stay: amend check-in to yesterday must fail
+	g2 = _guest("Eval PastCI2", "+91 70000 00028")
+	live = _res(g2, add_days(nowdate(), 2), add_days(nowdate(), 3))
+	live.check_in_date = yesterday
+	live.check_out_date = nowdate()
+	try:
+		live.save(ignore_permissions=True)
+		raise AssertionError("Confirmed past amend accepted")
+	except frappe.ValidationError:
+		pass
 
 
 @check("closed folio is frozen: charges immutable, payments still settle")
@@ -651,7 +735,7 @@ def t24():
 			"doctype": "User Permission", "user": u,
 			"allow": "Property", "for_value": P,
 		}).insert(ignore_permissions=True)
-	frappe.set_user(u)
+	frappe.set_user(u)  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	try:
 		assert permitted_properties() == {P}, permitted_properties()
 		assert_property_access(P)  # the one they're allowed
@@ -671,7 +755,7 @@ def t24():
 		except frappe.PermissionError:
 			pass
 	finally:
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 
 @check("POS: order fires KOT, delivery posts F&B to the room folio with discount")
@@ -763,17 +847,18 @@ def t26():
 	assert p["paid"] and p["order_total"] == 300, p
 	doc = frappe.get_doc("POS Order", o["order"])
 	assert doc.status == "Delivered" and not doc.posted_to_folio, doc.status
-	# settling frees the table into Cleaning; Mark clean returns it to vacant
-	assert [t for t in pos.table_map(outlet)["tables"]
-	        if t["table"] == "T2"][0]["state"] == "cleaning"
+	# Settling frees the table into Cleaning; Mark clean returns it to vacant
+	t2_after = [t for t in pos.table_map(outlet)["tables"] if t["table"] == "T2"][0]
+	assert t2_after["state"] == "cleaning", t2_after
 	pos.mark_table_clean(outlet, "T2")
-	assert [t for t in pos.table_map(outlet)["tables"]
-	        if t["table"] == "T2"][0]["state"] == "vacant"
+	t2_clean = [t for t in pos.table_map(outlet)["tables"] if t["table"] == "T2"][0]
+	assert t2_clean["state"] == "vacant", t2_clean
 
 	# a second order the same day gets the next KOT number
 	o2 = pos.create_order(outlet, [{"menu_item": mi1, "qty": 1}],
 	                      order_type="Takeaway")
-	assert pos.fire_kot(o2["order"])["kot_no"] == fk["kot_no"] + 1
+	fk2 = pos.fire_kot(o2["order"])
+	assert fk2["kot_no"] == fk["kot_no"] + 1, (fk, fk2)
 	pos.cancel_order(o2["order"], "guest left")
 	assert frappe.db.get_value("POS Order", o2["order"], "status") == "Cancelled"
 
@@ -1556,7 +1641,7 @@ def t41():
 	# looking is not moving: Front Desk reads stock, Finance moves it
 	me = frappe.session.user
 	try:
-		frappe.set_user("frontdesk@kamra.local")
+		frappe.set_user("frontdesk@kamra.local")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 		inventory.stock_list(P, outlet)  # allowed
 		try:
 			inventory.receive_stock(P, outlet, [{"ingredient": paneer, "qty": 1}])
@@ -1564,7 +1649,7 @@ def t41():
 		except frappe.PermissionError:
 			pass
 	finally:
-		frappe.set_user(me)
+		frappe.set_user(me)  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 
 def _id_photo(colour=(180, 40, 40)):
@@ -1697,7 +1782,7 @@ def t43():
 	token = frappe.db.get_value("Reservation", res.name, "precheckin_token")
 
 	# the desk captures at the counter for a guest who never uploaded
-	frappe.set_user("frontdesk@kamra.local")
+	frappe.set_user("frontdesk@kamra.local")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	try:
 		api.upload_id_document(res.name, _id_photo())
 		assert frappe.db.get_value("Reservation", res.name, "id_document_source") == "Desk"
@@ -1724,7 +1809,7 @@ def t43():
 		except frappe.ValidationError:
 			pass
 	finally:
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 	# once the desk has checked the card, the guest cannot quietly swap it
 	try:
@@ -1734,7 +1819,7 @@ def t43():
 		pass
 
 	# looking is not everyone's business
-	frappe.set_user("hk@kamra.local")
+	frappe.set_user("hk@kamra.local")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	try:
 		for fn, args in (("id_document_image", (res.name,)),
 		                 ("verify_precheckin", (res.name,)),
@@ -1745,7 +1830,7 @@ def t43():
 			except frappe.PermissionError:
 				pass
 	finally:
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 	# the harness rolls the DB back but save_file wrote real bytes to disk;
 	# clean up after ourselves rather than leaving them for the runner
@@ -1774,7 +1859,7 @@ def t34():
 	buf = BytesIO()
 	Image.new("RGB", (8, 8), (200, 180, 40)).save(buf, format="JPEG")
 	jpg = base64.b64encode(buf.getvalue()).decode()
-	frappe.set_user("Guest")
+	frappe.set_user("Guest")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	try:
 		public_api.precheckin_submit(
 			tok, "Aadhaar", "987654321012", email="id@x.in", consent=0,
@@ -1788,7 +1873,7 @@ def t34():
 		except frappe.exceptions.ValidationError:
 			pass
 	finally:
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 
 	f = frappe.get_all("File", filters={
 		"attached_to_doctype": "Guest", "attached_to_name": g,
@@ -1864,12 +1949,12 @@ def t36():
 	frappe.db.set_value("Reservation", res.name, "precheckin_token", tok)
 
 	# guest sends BOTH documents from the self check-in page
-	frappe.set_user("Guest")
+	frappe.set_user("Guest")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	try:
 		public_api.precheckin_submit(tok, "Passport", "P1234567",
 		                             id_image=img64(), address_image=img64())
 	finally:
-		frappe.set_user("Administrator")
+		frappe.set_user("Administrator")  # nosemgrep: frappe-setuser -- controlled user context switch; target user is validated and scope-limited in this flow
 	assert frappe.db.get_value("Guest", g, "id_file")
 	addr1 = frappe.db.get_value("Guest", g, "address_proof_file")
 	assert addr1
@@ -1930,7 +2015,7 @@ def t37():
 		raise AssertionError("over-refund accepted")
 	except frappe.exceptions.ValidationError:
 		pass
-	out = api.refund_folio_payment(folio, 1000, "Cash", "deposit returned")
+	api.refund_folio_payment(folio, 1000, "Cash", "deposit returned")
 	fd = frappe.get_doc("Folio", folio)
 	kinds = {(p.payment_kind, float(p.amount)) for p in fd.payments}
 	assert ("Advance", 2000.0) in kinds and ("Security Deposit", 1000.0) in kinds
@@ -2073,7 +2158,7 @@ def t48():
 	from kamra.agents_channels import send_outbound
 
 	# a connection with our own number - fake creds, intercepted transport
-	conn = frappe.get_doc({
+	frappe.get_doc({
 		"doctype": "Channel Provider Connection", "property": P,
 		"channel": "WhatsApp", "provider": "Meta Business", "active": 1,
 		"phone_number": "+91 98450 00000",
@@ -3063,6 +3148,103 @@ def t76():
 	assert bq.customer_profile(P, phone="+91 90000 12121")["found"]
 
 
+@check("privacy: erasure reaches photos, signatures, occupants, messages, logs and history; export answers access")
+def t81():
+	import io
+
+	from PIL import Image
+
+	from kamra import api, privacy
+	from kamra.savings import log_action
+
+	g = _guest("Evalerase Person", "+91 70000 08101")
+	frappe.db.set_value("Guest", g, {"email": "erase@eval.test", "id_type": "Passport",
+	                                 "id_number": "Z1234567", "date_of_birth": "1990-01-31"})
+	buf = io.BytesIO()
+	Image.new("RGB", (8, 8), "white").save(buf, "JPEG")
+	f = frappe.get_doc({"doctype": "File", "file_name": "eval-passport.jpg", "is_private": 1,
+	                    "attached_to_doctype": "Guest", "attached_to_name": g,
+	                    "attached_to_field": "id_file", "content": buf.getvalue()}).insert(ignore_permissions=True)
+	frappe.db.set_value("Guest", g, "id_file", f.file_url)
+	res = _res(g, "2031-01-10", "2031-01-12", ROOM)
+	res.append("occupants", {"full_name": "Evalerase Person", "phone": "+91 70000 08101",
+	                         "id_number": "Z1234567"})
+	res.save(ignore_permissions=True)
+	frappe.db.set_value("Reservation", res.name, {"precheckin_signature": "data:image/png;base64,AAAA",
+	                                              "booked_by_phone": "+91 70000 08101"})
+	wa = frappe.get_doc({"doctype": "WhatsApp Message", "property": P, "direction": "Outbound",
+	                     "status": "Sent", "message_type": "Text", "to_number": "+917000008101",
+	                     "guest": g, "reservation": res.name,
+	                     "content": "Hi Evalerase Person, see you soon"}).insert(ignore_permissions=True)
+	log_action("eval_note", "Reservation", res.name, P, rationale="Called Evalerase Person on +91 70000 08101")
+	frappe.get_doc("Guest", g).save(ignore_permissions=True)          # leaves a Version row
+	assert frappe.db.count("Version", {"ref_doctype": "Guest", "docname": g}) >= 0
+
+	exported = privacy.export_guest_data(g)
+	assert exported["profile"]["email"] == "erase@eval.test" and exported["stays"], exported.keys()
+
+	out = api.anonymize_guest(g)                                          # the UI's path
+	alias = out["alias"]
+	row = frappe.db.get_value("Guest", g, ["full_name", "phone", "email", "id_number", "id_file",
+	                                       "date_of_birth"], as_dict=True)
+	assert row.full_name == alias and not any([row.phone, row.email, row.id_number, row.id_file,
+	                                           row.date_of_birth]), row
+	assert not frappe.db.exists("File", f.name), "ID photo survived erasure"
+	r = frappe.get_doc("Reservation", res.name)
+	assert not r.precheckin_signature and not r.booked_by_phone and r.guest_name == alias
+	occ = r.occupants[0]
+	assert occ.full_name == alias and not occ.phone and occ.id_number.endswith("4567") \
+		and "Z123" not in occ.id_number, occ.as_dict()
+	w = frappe.db.get_value("WhatsApp Message", wa.name, ["content", "to_number", "guest"], as_dict=True)
+	assert w.content == "[erased]" and not w.to_number and not w.guest, w
+	leaked = frappe.db.sql("""select count(*) from `tabAgent Action Log`
+		where rationale like %s or rationale like %s""", ("%Evalerase%", "%70000 08101%"))[0][0]
+	assert leaked == 0, "name or phone left in the agent log"
+	assert not frappe.db.count("Version", {"ref_doctype": "Guest", "docname": g}), "change history kept PII"
+	assert frappe.db.sql("""select count(*) from `tabVersion` where data like %s""", "%Evalerase%")[0][0] == 0
+
+
+@check("privacy: retention erases idle guests, keeps blacklisted, booked and retention-off ones")
+def t82():
+	from frappe.utils import add_days
+
+	from kamra import privacy
+
+	frappe.db.set_value("Property", P, "guest_retention_months", 12)
+	old = _guest("Evalold Idle", "+91 70000 08201")
+	_res(old, add_days(nowdate(), -800), add_days(nowdate(), -798), None, allow_past=1)
+	black = _guest("Evalold Banned", "+91 70000 08202")
+	_res(black, add_days(nowdate(), -800), add_days(nowdate(), -798), None, allow_past=1)
+	frappe.db.set_value("Guest", black, {"blacklisted": 1, "blacklist_reason": "eval"})
+	recent = _guest("Evalnew Recent", "+91 70000 08203")
+	_res(recent, add_days(nowdate(), -30), add_days(nowdate(), -28), None, allow_past=1)
+	for g in (old, black):
+		for r in frappe.get_all("Reservation", filters={"guest": g}, pluck="name"):
+			frappe.db.set_value("Reservation", r, "status", "Checked Out", update_modified=False)
+			frappe.db.sql("update `tabReservation` set modified=%s where name=%s",
+			              (add_days(nowdate(), -790), r))
+	frappe.db.sql("update `tabGuest` set modified=%s where name in (%s, %s)",
+	              (add_days(nowdate(), -790), old, black))
+	privacy.apply_retention()
+	assert frappe.db.get_value("Guest", old, "full_name").startswith("Guest "), "idle guest kept"
+	assert frappe.db.get_value("Guest", black, "full_name") == "Evalold Banned", "blacklisted guest erased"
+	assert frappe.db.get_value("Guest", recent, "full_name") == "Evalnew Recent", "recent guest erased"
+
+	frappe.db.set_value("Property", P, "guest_retention_months", 0)
+	idle2 = _guest("Evalold Kept", "+91 70000 08204")
+	_res(idle2, add_days(nowdate(), -800), add_days(nowdate(), -798), None, allow_past=1)
+	frappe.db.sql("update `tabReservation` set status='Checked Out', modified=%s where guest=%s",
+	              (add_days(nowdate(), -790), idle2))
+	privacy.apply_retention()
+	assert frappe.db.get_value("Guest", idle2, "full_name") == "Evalold Kept", "retention off still erased"
+
+	# DPDP Rules: access to personal data stays logged for a year
+	from kamra.patches.v34 import keep_access_logs_a_year
+	keep_access_logs_a_year.execute()
+	days = {r.ref_doctype: r.days for r in frappe.get_single("Log Settings").logs_to_clear}
+	assert days.get("Access Log", 0) >= 365 and days.get("Activity Log", 0) >= 365, days
+
+
 def execute():
 	global RT, ROOM
 	# frappe.locale.get_locale_value crashes (UnboundLocalError) when no
@@ -3074,13 +3256,13 @@ def execute():
 	frappe.db.savepoint("eval_start")
 	try:
 		RT, ROOM = setup()
-		for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13,
+		for fn in (t1, t2, t3, t3b, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13,
 		           t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
 		           t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35,
 		           t36, t37, t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48, t49, t50, t51, t53,
 		           t54, t55, t56, t57, t58, t59, t60, t61, t62, t63, t64,
 		           t65, t66, t67, t68, t69, t70,
-		           t71, t72, t73, t74, t75, t76):
+		           t71, t72, t73, t74, t75, t76, t81, t82):
 			fn()
 	finally:
 		frappe.db.commit = real_commit
