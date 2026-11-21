@@ -135,20 +135,33 @@ jobs:
             # Safety net: back up the live Kamra site (DB + files) with the
             # CURRENT image, before new code can touch it. Fails the deploy if
             # the backup fails. Copies land in /root/backups/kamra (last 30 kept).
-            if [ -n "$(docker compose ps -q backend 2>/dev/null)" ]; then
+            # The DB is dumped from the db container itself: bench backup uses the
+            # image's newer mariadb-dump, which insists on TLS that mariadb:10.6
+            # here does not offer.
+            if [ -n "$(docker compose ps -q db 2>/dev/null)" ] && \
+               [ -n "$(docker compose ps -q backend 2>/dev/null)" ]; then
               # a container started before a Docker/runc upgrade can refuse exec
               # ("SetSSB requires libseccomp"); a restart fixes it. If exec still
               # fails, set -e stops the deploy - never skip the backup silently.
-              docker compose exec -T backend true 2>/dev/null || docker compose restart backend
-              docker compose exec -T backend true
-            fi
-            if [ -n "$(docker compose ps -q backend 2>/dev/null)" ] && \
-               docker compose exec -T backend test -d "sites/$SITE"; then
-              docker compose exec -T backend bench --site "$SITE" backup --with-files
-              mkdir -p /root/backups/kamra
-              docker compose cp "backend:/home/frappe/frappe-bench/sites/$SITE/private/backups/." /root/backups/kamra/
-              ls -1t /root/backups/kamra/* | tail -n +31 | xargs -r rm -f
-              echo "Kamra backup: $(ls -1t /root/backups/kamra | head -4 | tr '\n' ' ')"
+              for SVC in db backend; do
+                docker compose exec -T $SVC true 2>/dev/null || docker compose restart $SVC
+                docker compose exec -T $SVC true
+              done
+              sleep 5
+              STAMP=$(date +%F-%H%M)
+              B=/root/backups/kamra
+              mkdir -p $B
+              docker compose exec -T db sh -c \
+                'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --routines --events --all-databases' \
+                | gzip > $B/kamra-db-$STAMP.sql.gz
+              # gzip hides a failed dump - check it really holds tables
+              zcat $B/kamra-db-$STAMP.sql.gz | grep -q "CREATE TABLE" \
+                || { echo "Kamra DB backup is empty - aborting deploy"; exit 1; }
+              docker compose exec -T backend sh -c \
+                "cd sites/$SITE && tar czf - \$(ls -d public/files private/files 2>/dev/null)" \
+                > $B/kamra-files-$STAMP.tar.gz
+              ls -1t $B/* | tail -n +21 | xargs -r rm -f
+              echo "Kamra backup: $(ls -lh $B/kamra-*-$STAMP.* | awk '{print $5, $9}' | tr '\n' ' ')"
             fi
 
             echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u cymonmachera --password-stdin
