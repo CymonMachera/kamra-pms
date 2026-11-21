@@ -8,16 +8,12 @@ on:
     branches: [machera]
   workflow_dispatch:
     inputs:
-      cutover:
-        description: "Point citizen.machera.co.tz at Kamra and stop QloApps"
+      install_vhost:
+        description: "(Re)install the citizen.machera.co.tz nginx vhost pointing at Kamra"
         type: boolean
         default: false
       reset_site:
         description: "DANGER: drop and recreate the site (destroys lodge data)"
-        type: boolean
-        default: false
-      purge_qloapps:
-        description: "Remove the retired QloApps stack (archives its DB first)"
         type: boolean
         default: false
       tune_server:
@@ -39,7 +35,7 @@ env:
 
 jobs:
   build:
-    if: ${{ !inputs.purge_qloapps && !inputs.tune_server && !inputs.seed_lodge }}
+    if: ${{ !inputs.tune_server && !inputs.seed_lodge }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -87,7 +83,7 @@ jobs:
 
   deploy:
     needs: build
-    if: ${{ !inputs.purge_qloapps && !inputs.tune_server && !inputs.seed_lodge }}
+    if: ${{ !inputs.tune_server && !inputs.seed_lodge }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,17 +109,7 @@ jobs:
             set -e
             SITE="${{ secrets.KAMRA_SITE }}"
 
-            # One-time safety net: keep a dated dump of the outgoing QloApps data
             mkdir -p /root/backups
-            if docker ps --format '{{.Names}}' | grep -q '^citizen-lodge$'; then
-              STAMP=$(date +%F)
-              if [ ! -f "/root/backups/qloapps-final-$STAMP.sql.gz" ]; then
-                docker exec citizen-lodge mysqldump -uroot citizenlodge 2>/dev/null \
-                  | gzip > "/root/backups/qloapps-final-$STAMP.sql.gz" || true
-                echo "QloApps backup: $(ls -lh /root/backups/qloapps-final-$STAMP.sql.gz | awk '{print $5}')"
-              fi
-            fi
-
             mkdir -p /opt/citizen-lodge-kamra && cd /opt/citizen-lodge-kamra
             mv -f compose.yaml docker-compose.yml 2>/dev/null || true
             cat > .env <<EOF
@@ -194,23 +180,19 @@ jobs:
             docker compose exec -T backend bench --site all migrate
             docker compose exec -T backend bench --site "$SITE" set-config host_name "https://$SITE" || true
 
-            # Cutover: hand the public domain from QloApps to Kamra
-            if [ "${{ inputs.cutover }}" = "true" ]; then
-              echo "=== CUTOVER ==="
+            # Point the public domain at Kamra (needed only on a fresh server)
+            if [ "${{ inputs.install_vhost }}" = "true" ]; then
               # verify Kamra answers locally before handing it the domain
               code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $SITE" http://127.0.0.1:8083/login || echo 000)
               if [ "$code" != "200" ]; then
-                echo "Kamra not healthy (HTTP $code) - aborting cutover, QloApps untouched"
+                echo "Kamra not healthy (HTTP $code) - vhost left unchanged"
                 exit 1
               fi
-              # keep the previous vhost so rollback is one copy away
-              cp -n /etc/nginx/sites-available/citizen.conf \
-                    /root/backups/nginx-citizen-qloapps.conf.bak 2>/dev/null || true
+              cp -f /etc/nginx/sites-available/citizen.conf /root/backups/nginx-citizen.conf.bak 2>/dev/null || true
               cp nginx-citizen.conf /etc/nginx/sites-available/citizen.conf
+              ln -sf /etc/nginx/sites-available/citizen.conf /etc/nginx/sites-enabled/citizen.conf
               nginx -t && systemctl reload nginx
-              docker stop citizen-lodge || true
-              docker update --restart=no citizen-lodge || true
-              echo "QloApps stopped; citizen.machera.co.tz now serves Kamra."
+              echo "citizen.machera.co.tz -> Kamra (127.0.0.1:8083)"
             fi
 
             docker image prune -f
@@ -245,89 +227,6 @@ jobs:
             df -h / | awk 'NR==2{print $4" free of "$2}'
             echo "=== heaviest containers ==="
             docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' | sort -k2 -h -r | head -8
-
-  purge-qloapps:
-    if: ${{ inputs.purge_qloapps }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Verify the archive exists on the server
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            set -e
-            mkdir -p /root/backups
-            # Drop any empty placeholder volumes a previous mistyped run created
-            for v in citizen-lodge_qloapps-mysql citizen-lodge_qloapps-www; do
-              docker volume rm "$v" 2>/dev/null || true
-            done
-            # Discover the real QloApps volumes rather than assuming their names
-            VOLS=$(docker volume ls -q | grep -E '^citizen-lodge_' || true)
-            if [ -z "$VOLS" ]; then
-              echo "No citizen-lodge volumes on this host - nothing to archive or purge."
-              exit 1
-            fi
-            echo "volumes found:"; echo "$VOLS" | sed 's/^/  /'
-            # Hard guard: never touch anything belonging to the live Kamra stack
-            if echo "$VOLS" | grep -q 'kamra'; then
-              echo "FATAL: selection includes a Kamra volume - aborting."; exit 1
-            fi
-            MOUNTS=""
-            for v in $VOLS; do MOUNTS="$MOUNTS -v $v:/data/$v:ro"; done
-            # File-level archive: no DB credentials needed; captures database,
-            # uploaded images and config verbatim.
-            docker run --rm $MOUNTS -v /root/backups:/backup \
-              alpine tar czf /backup/qloapps-archive.tar.gz -C /data .
-            SIZE=$(stat -c%s /root/backups/qloapps-archive.tar.gz)
-            echo "archive: /root/backups/qloapps-archive.tar.gz ($SIZE bytes)"
-            if [ "$SIZE" -lt 1000000 ]; then
-              echo "Archive under 1MB - that cannot be a real QloApps install. Refusing to purge."
-              exit 1
-            fi
-            # sanity: the guest table must be in there
-            docker run --rm -v /root/backups:/backup alpine \
-              tar tzf /backup/qloapps-archive.tar.gz | grep -q 'mysql/citizenlodge' \
-              && echo "verified: citizenlodge database present in archive"
-
-      - name: Fetch the archive off the server
-        run: |
-          mkdir -p archive ~/.ssh
-          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_deploy
-          chmod 600 ~/.ssh/id_deploy
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
-          scp -i ~/.ssh/id_deploy ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/root/backups/qloapps-archive.tar.gz archive/
-          ls -lh archive/
-
-      - name: Keep it as a downloadable artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: qloapps-final-archive
-          path: ./archive/qloapps-archive.tar.gz
-          retention-days: 90
-          if-no-files-found: error
-
-      - name: Remove the QloApps stack
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            set -e
-            docker rm -f citizen-lodge 2>/dev/null || true
-            for v in $(docker volume ls -q | grep -E '^citizen-lodge_' || true); do
-              case "$v" in *kamra*) echo "skipping $v (Kamra)"; continue;; esac
-              docker volume rm "$v" 2>/dev/null || true
-            done
-            docker rmi webkul/qloapps_docker:latest 2>/dev/null || true
-            docker rmi ghcr.io/cymonmachera/citizen-lodge:latest 2>/dev/null || true
-            rm -rf /opt/citizen-lodge
-            docker system prune -f
-            echo "=== QloApps removed. Disk now: ==="
-            df -h / | awk 'NR==2{print $4" free of "$2}'
-            free -h | awk 'NR==2{print $7" RAM available"}'
 
   seed-lodge:
     if: ${{ inputs.seed_lodge }}
