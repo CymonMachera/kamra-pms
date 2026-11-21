@@ -135,6 +135,13 @@ jobs:
             # Safety net: back up the live Kamra site (DB + files) with the
             # CURRENT image, before new code can touch it. Fails the deploy if
             # the backup fails. Copies land in /root/backups/kamra (last 30 kept).
+            if [ -n "$(docker compose ps -q backend 2>/dev/null)" ]; then
+              # a container started before a Docker/runc upgrade can refuse exec
+              # ("SetSSB requires libseccomp"); a restart fixes it. If exec still
+              # fails, set -e stops the deploy - never skip the backup silently.
+              docker compose exec -T backend true 2>/dev/null || docker compose restart backend
+              docker compose exec -T backend true
+            fi
             if [ -n "$(docker compose ps -q backend 2>/dev/null)" ] && \
                docker compose exec -T backend test -d "sites/$SITE"; then
               docker compose exec -T backend bench --site "$SITE" backup --with-files
