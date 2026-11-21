@@ -132,6 +132,18 @@ jobs:
             EOF
             chmod 600 .env
 
+            # Safety net: back up the live Kamra site (DB + files) with the
+            # CURRENT image, before new code can touch it. Fails the deploy if
+            # the backup fails. Copies land in /root/backups/kamra (last 30 kept).
+            if [ -n "$(docker compose ps -q backend 2>/dev/null)" ] && \
+               docker compose exec -T backend test -d "sites/$SITE"; then
+              docker compose exec -T backend bench --site "$SITE" backup --with-files
+              mkdir -p /root/backups/kamra
+              docker compose cp "backend:/home/frappe/frappe-bench/sites/$SITE/private/backups/." /root/backups/kamra/
+              ls -1t /root/backups/kamra/* | tail -n +31 | xargs -r rm -f
+              echo "Kamra backup: $(ls -1t /root/backups/kamra | head -4 | tr '\n' ' ')"
+            fi
+
             echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u cymonmachera --password-stdin
             docker compose pull
             docker compose up -d
@@ -158,7 +170,8 @@ jobs:
               docker compose exec -T backend bash -c \
                 "bench --site '$SITE' list-apps | grep -q $APP || bench --site '$SITE' install-app $APP"
             done
-            docker compose exec -T backend bench --site all migrate || true
+            # No "|| true": a failed migration must fail the deploy (the backup above is the way back)
+            docker compose exec -T backend bench --site all migrate
             docker compose exec -T backend bench --site "$SITE" set-config host_name "https://$SITE" || true
 
             # Cutover: hand the public domain from QloApps to Kamra
