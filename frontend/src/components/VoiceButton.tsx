@@ -46,6 +46,7 @@ export const VOICE_LANGS: [string, string][] = [
   ["ar-SA", "العربية"],
   ["es-ES", "Español"],
   ["pt-BR", "Português (Brasil)"],
+  ["sw-TZ", "Kiswahili (Tanzania)"],
 ]
 
 const KEY = "kamra_voice_lang"

@@ -4,12 +4,18 @@ import { dictionaryFor } from "./locales"
 
 export type Vars = Record<string, string | number>
 
+// Callers pass English plural/ordinal endings ("s", "ies", "st") as
+// variables. Swahili doesn't inflect that way, so those fill in empty.
+const NO_ENGLISH_ENDINGS = new Set(["sw"])
+const ENGLISH_ENDING = /^(s\d*|es|ies|ord)$/
+
 /** Replace `{name}` placeholders in a template. Arabic (and others) can
  * reorder words by placing the same placeholders differently. */
-function interpolate(template: string, vars?: Vars): string {
+function interpolate(template: string, vars?: Vars, language?: string): string {
   if (!vars) return template
+  const blank = language !== undefined && NO_ENGLISH_ENDINGS.has(language)
   return template.replace(/\{(\w+)\}/g, (_, k: string) =>
-    vars[k] !== undefined && vars[k] !== null ? String(vars[k]) : `{${k}}`,
+    blank && ENGLISH_ENDING.test(k) ? "" : vars[k] !== undefined && vars[k] !== null ? String(vars[k]) : `{${k}}`,
   )
 }
 
@@ -27,7 +33,8 @@ export function t(s: string, vars?: Vars): string
 export function t<T>(s: T): T
 export function t(s: unknown, vars?: Vars): unknown {
   if (typeof s !== "string") return s
-  return interpolate(translated(s, getLang()), vars)
+  const language = getLang()
+  return interpolate(translated(s, language), vars, language)
 }
 
 /** English plural form for a count: "one" or "other". Arabic and other
@@ -63,7 +70,7 @@ export function useT() {
   const lang = useUILanguage()
   const t = useCallback(
     (s: string, vars?: Vars) => {
-      return interpolate(translated(s, lang), vars)
+      return interpolate(translated(s, lang), vars, lang)
     },
     [lang],
   )
