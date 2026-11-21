@@ -12,7 +12,8 @@ import AppShell, { type ShellContext } from "./AppShell"
 const Login = lazy(() => import("./screens/Login"))
 const UpdatePassword = lazy(() => import("./screens/UpdatePassword"))
 import { useAuth } from "./lib/auth"
-import { visibleApps } from "./lib/apps"
+import { roleCanOpen, visibleApps } from "./lib/apps"
+import { whoami } from "./lib/api"
 import { t, useT, t as translate, useUILanguage } from "./lib/i18n"
 import { toFullPath } from "./lib/routing"
 import { syncLang } from "./lib/dir"
@@ -139,20 +140,29 @@ function Home() {
  *  On success, a full-page nav re-boots with the authenticated session's CSRF
  *  token (login rotates it); dev soft-navigates. */
 function LoginPage() {
-  const { status, refresh } = useAuth()
+  const { status, refresh, roles } = useAuth()
   const location = useLocation()
   const navigate = useNavigate()
   const from = (location.state as { from?: string } | null)?.from || "/"
+  // only return to `from` if this person may open it - otherwise their home
+  const allowed = (path: string, r: string[]) => roleCanOpen(path.split(/[?#]/)[0], r)
   if (status === "loading") return <Splash />
-  if (status === "authed") return <Navigate to={from} replace />
+  if (status === "authed") return <Navigate to={allowed(from, roles) ? from : "/"} replace />
   return (
     <Login
       onSuccess={async () => {
+        let target = from
+        try {
+          const w = await whoami()
+          if (!allowed(from, w.roles ?? [])) target = "/"
+        } catch {
+          // can't tell - keep the old behaviour
+        }
         if (import.meta.env.PROD) {
-          window.location.assign(toFullPath(from))
+          window.location.assign(toFullPath(target))
         } else {
           await refresh()
-          navigate(from, { replace: true })
+          navigate(target, { replace: true })
         }
       }}
     />

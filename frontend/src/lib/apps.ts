@@ -456,6 +456,22 @@ export function appForPath(pathname: string, among: AppDef[] = APPS, keep?: stri
   return best?.app ?? APPS[0]
 }
 
+/** Machera: may these roles open this menu page? A page that is no app's
+ *  menu item (a drill-in, a guest page) counts as reachable - the server
+ *  still decides. Used after sign-in so a shared desk PC doesn't drop the
+ *  next person on the previous person's page (a receptionist on Owner view). */
+export function roleCanOpen(pathname: string, roles: string[]): boolean {
+  const listed = APPS.flatMap((a) =>
+    a.items.filter((i) => i.to === pathname).map((i) => ({ a, i })),
+  )
+  if (!listed.length) return true
+  return listed.some(
+    ({ a, i }) =>
+      a.roles.some((r) => roles.includes(r)) &&
+      (!i.roles || i.roles.some((r) => roles.includes(r))),
+  )
+}
+
 /** The apps this user can reach: their roles must allow it AND the
  *  property must actually run it. Roles alone were never enough - Front
  *  Desk unlocks both F&B and Banquets, so a serviced-apartment operator

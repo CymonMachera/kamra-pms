@@ -23,6 +23,7 @@ import { Avatar } from "./components/ui/avatar"
 import { Button } from "./components/ui/button"
 import {
   appForPath,
+  roleCanOpen,
   useConnectedApps,
   visibleApps,
   type AppDef,
@@ -381,6 +382,11 @@ export default function AppShell() {
   const { t } = useT()
   const location = useLocation()
   const navigate = useNavigate()
+  // Machera: a menu page this person's roles can't open (left open by the
+  // previous person on a shared desk PC) sends them to their own home
+  useEffect(() => {
+    if (roles.length && !roleCanOpen(location.pathname, roles)) navigate("/", { replace: true })
+  }, [roles, location.pathname, navigate])
   const [booking, setBooking] = useState<BookingInitial | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [properties, setProperties] = useState<PropertyRow[]>([])
