@@ -2,7 +2,7 @@
 
 Kamra talks to guests over WhatsApp through **Meta's official Cloud
 API**, on a number you own. Nothing sits in between: no gateway
-markup, no per-message fee to Kamra — Meta bills you directly at
+markup, no per-message fee to Kamra - Meta bills you directly at
 their per-conversation rates (marketing/utility conversations are a
 few cents; most hotel traffic falls in the cheaper *utility* bucket,
 and guest-initiated *service* conversations are free).
@@ -13,10 +13,11 @@ What you get once connected:
   every confirmed booking
 - **Payment requests** from the desk
 - **Guest replies** land in *Operations → WhatsApp* as chat threads,
-  and messages from in-house guests also raise a Service Ticket
-- Housekeeping SLA escalations to managers on WhatsApp
+  and messages from in-house guests also raise a Service Ticket with the
+  **WhatsApp** source badge
+- Housekeeping SLA escalations on WhatsApp: first to Front Desk staff, then to Hotel Admins
 
-## Step 1 — get a WhatsApp Business number from Meta
+## Step 1 - get a WhatsApp Business number from Meta
 
 You need a Meta developer app with the WhatsApp product. About 20
 minutes, free:
@@ -24,12 +25,12 @@ minutes, free:
 1. Go to [developers.facebook.com](https://developers.facebook.com) →
    **My Apps → Create App** → type **Business**.
 2. In the new app, click **Add product → WhatsApp → Set up**. Meta
-   attaches a *test number* immediately — fine for trying things out.
+   attaches a *test number* immediately - fine for trying things out.
 3. To use **your own number**: WhatsApp → **API Setup → Add phone
    number**. The number must not be registered on the WhatsApp app
    (a fresh SIM or a landline that can receive a verification call
    works well). Complete [business verification](https://www.facebook.com/business/help/2058515294227817)
-   in Meta Business Manager — this is the step that takes a day or
+   in Meta Business Manager - this is the step that takes a day or
    two of Meta's review.
 4. From **WhatsApp → API Setup**, note two values:
    - **Phone number ID** (a long number under the phone dropdown)
@@ -38,7 +39,7 @@ minutes, free:
      give it access to the app with the `whatsapp_business_messaging`
      permission, and **Generate token** with no expiry.
 
-## Step 2 — connect it in Kamra
+## Step 2 - connect it in Kamra
 
 *Operations → Channels → New* (you need the Hotel Admin role):
 
@@ -49,11 +50,17 @@ minutes, free:
 | Phone number (display) | your number, e.g. `+91 98…` |
 | Meta phone number ID | from API Setup |
 | Access token | the permanent System User token |
-| Webhook verify token | any string you invent — you'll paste the same one into Meta |
+| Webhook verify token | any string you invent - you'll paste the same one into Meta |
 | Template language code | `en` (or the language your templates are approved in) |
 | Active | ✓ |
 
-## Step 3 — point Meta's webhook at Kamra
+![The New Channel form filled in for WhatsApp on Meta Business, with the template names from Step 4](/img/whatsapp/channel-form.png)
+
+The form also asks for the **Meta App Secret** (Meta app → **App
+settings → Basic**). Kamra checks the signature of every incoming
+message with it, so inbound messages need it.
+
+## Step 3 - point Meta's webhook at Kamra
 
 This is what makes **incoming** guest messages appear.
 
@@ -61,37 +68,44 @@ This is what makes **incoming** guest messages appear.
 2. Callback URL:
    `https://YOUR-SITE/api/method/kamra.whatsapp.webhook`
 3. Verify token: the same string you entered on the Channels screen.
-   Click **Verify and save** — Kamra answers Meta's challenge.
+   Click **Verify and save** - Kamra answers Meta's challenge.
 4. Under **Webhook fields**, subscribe to **messages**.
 
 From now on, anything a guest writes to your number shows up in
-*Operations → WhatsApp* as a conversation thread, and — if the sender
-matches an in-house guest — raises a Service Ticket on the desk queue.
+*Operations → WhatsApp* as a conversation thread, and - if the sender
+matches an in-house guest - raises a Service Ticket on the desk queue,
+marked with the **WhatsApp** badge ([Operations](/operations#where-tickets-come-from)).
 
-## Step 4 — register your message templates
+## Step 4 - register your message templates
 
 WhatsApp only lets a business **start** a conversation with a
-pre-approved template (guests writing to you first need no template —
+pre-approved template (guests writing to you first need no template  - 
 that opens a free-form 24-hour session). Create these in
 [Meta Business Manager → WhatsApp Manager → Message templates](https://business.facebook.com/wa/manage/message-templates/),
 category **Utility**, then put their names on the Channels screen.
 
-**`kamra_booking_confirmation`** — variables are guest, property,
+**`kamra_booking_confirmation`** - variables are guest, property,
 check-in, check-out:
 
-> Hello {{1}}! Your booking at {{2}} is confirmed — arriving {{3}},
+> Hello {{1}}! Your booking at {{2}} is confirmed - arriving {{3}},
 > departing {{4}}. We look forward to hosting you. Reply to this
 > message any time; a person answers.
 
-**`kamra_precheckin_link`** — guest, link:
+**`kamra_precheckin_link`** - guest, link:
 
 > {{1}}, skip the front-desk queue: complete your check-in online
-> before you arrive — {{2}}
+> before you arrive - {{2}}
 
-**`kamra_payment_request`** — guest, amount, note:
+**`kamra_payment_request`** - guest, amount, note:
 
 > Hello {{1}}, a payment of {{2}} is due for your stay ({{3}}). You
 > can pay online or at the front desk.
+
+**`kamra_room_charge`** (optional) - guest, amount, what and where,
+balance:
+
+> Hello {{1}}, {{2}} was added to your room bill: {{3}}. Your balance is
+> now {{4}}. Questions? Reply here or call the front desk.
 
 Approval usually takes minutes for Utility templates. Once approved,
 type each template's exact name into the matching field on the
@@ -100,30 +114,46 @@ Channels connection.
 ::: tip Designing more templates
 The community [frappe_whatsapp](https://github.com/shridarpatil/frappe_whatsapp)
 app has a visual, drag-and-drop template builder with a live
-compliance checklist ([PR #247](https://github.com/shridarpatil/frappe_whatsapp/pull/247)) —
+compliance checklist ([PR #247](https://github.com/shridarpatil/frappe_whatsapp/pull/247))  - 
 useful for prototyping template copy before you register it with Meta.
 :::
 
-## Step 5 — send and receive
+## Step 5 - send and receive
 
 Nothing else to configure:
 
 - **Automatic**: every new confirmed booking sends the confirmation
-  and, if the template is set, the self check-in link. Housekeeping
-  escalations go to the manager's number.
-- **Conversations**: *Operations → WhatsApp* is the inbox — threads on
-  the left, chat on the right, reply box at the bottom. Replies
+  and, if the template is set, the self check-in link. An overdue
+  housekeeping task is sent first to every Front Desk user (the message
+  ends *escalated to the front desk*), then, if it's still open, to every
+  Hotel Admin (*escalated to the hotel admin*).
+- **Conversations**: *Operations → WhatsApp* is the inbox - threads on
+  the left, chat on the right, reply box at the bottom.
+
+  ![The WhatsApp inbox: one guest thread with the booking confirmation and check-in link templates, the guest's question and the desk's reply](/img/whatsapp/inbox.png)
+ Replies
   deliver free-form while the guest's 24-hour session window is open
   (any guest message reopens it); outside the window, WhatsApp only
   accepts templates, and the screen tells you so.
 - **Payment requests**: from the stay, `send_payment_request` posts
   the amount with your payment template.
+- **Room charge alerts** (off until you turn them on): with the
+  `kamra_room_charge` template on the connection and **Settings → Front
+  Desk → Guest alerts → WhatsApp the guest when a charge is posted to the
+  room** ticked, an in-house guest gets a message when a restaurant bill,
+  laundry, minibar or desk charge is posted to their room, with the
+  running balance. Room nights from the night audit, company and group
+  bills, discounts and zero amounts never send one, and a bill gets at
+  most one message every 10 minutes (the next one shows the new
+  balance). The message is sent after the charge is saved, so a WhatsApp
+  outage never stops a posting. It is a stay message, so a guest's STOP
+  (marketing opt-out) does not turn it off.
 - Every message in both directions is stored as a *WhatsApp Message*
   record, so the history is queryable and auditable.
 
 ## Campaigns and marketing broadcasts
 
-Kamra's built-in integration is deliberately **transactional** — the
+Kamra's built-in integration is deliberately **transactional** - the
 messages a stay generates. For marketing broadcasts (offers to past
 guests, campaign blasts), install the community
 [frappe_whatsapp](https://github.com/shridarpatil/frappe_whatsapp)
@@ -136,8 +166,29 @@ bench --site yoursite install-app frappe_whatsapp
 
 It uses the same Meta credentials, adds template syncing from Frappe,
 notification-on-doctype-event rules, and bulk sends. Keep marketing
-lists consented — WhatsApp bans numbers that message people who
-didn't opt in.
+lists consented: filter them on the guest's **Marketing consent**
+(below). WhatsApp bans numbers that message people who didn't opt in.
+
+## Marketing consent and opt-out
+
+Booking confirmations, check-in links and payment requests are service
+messages and always go out. Offers and promotions (Meta category
+**Marketing**) need the guest's recorded consent.
+
+- **Opting in** is always explicit, and never pre-ticked: the *Send me
+  offers on WhatsApp* box on the booking page, *Guest agrees to offers
+  on WhatsApp* in the desk booking dialog, the *Offers on WhatsApp*
+  toggle in the guest profile, or the guest replying **START**.
+- **Opting out** is as easy: the guest replies **STOP** or
+  **UNSUBSCRIBE** (also **BAJA**, **ALTO**, **PARAR**, **SAIR**,
+  **إلغاء**, **توقف**; any case), or the desk clears the toggle. The
+  guest gets one confirmation in the language of the word they sent.
+- The guest profile shows when consent last changed and how (booking
+  page, desk or WhatsApp keyword). Every change is also written to the
+  activity log with who made it.
+- `kamra.whatsapp.send_marketing` sends a promotional template to one
+  guest and refuses when they have not opted in. Use it (or filter on
+  the consent field) for any promotional send.
 
 ## Troubleshooting
 
@@ -145,6 +196,6 @@ didn't opt in.
 |---|---|
 | Webhook verification fails | Verify token on the Channels screen doesn't match what you typed in Meta, or the connection isn't Active |
 | Outbound shows **Failed** with `(#132001)` | Template name or language doesn't match an approved template |
-| Outbound Failed with `Re-engagement message` | The 24-hour session closed — use a template, or wait for the guest to write |
+| Outbound Failed with `Re-engagement message` | The 24-hour session closed - use a template, or wait for the guest to write |
 | Messages send but nothing arrives inbound | Webhook fields not subscribed to **messages** |
-| `401` from Meta | Token expired — use a System User token, not the 24-hour test token |
+| `401` from Meta | Token expired - use a System User token, not the 24-hour test token |

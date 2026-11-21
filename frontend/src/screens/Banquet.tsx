@@ -45,7 +45,8 @@ import {
   STATUSES,
   today,
 } from "./banquet/shared"
-import { useT } from "../lib/i18n"
+import { useT, t as translate } from "../lib/i18n"
+
 
 type Tab = "today" | "pipeline" | "functions"
 
@@ -72,6 +73,9 @@ export default function Banquet() {
   const [error, setError] = useState<string | null>(null)
   const [reminders, setReminders] = useState<ReminderRow[] | null>(null)
   const [pipeline, setPipeline] = useState<BanquetPipeline | null>(null)
+  // "" = the next six months from the 1st
+  const [fromDate, setFromDate] = useState("")
+  const [toDate, setToDate] = useState("")
   const [rows, setRows] = useState<FunctionRow[] | null>(null)
   const [query, setQuery] = useState("")
   const [statusFilter, setStatusFilter] = useState("")
@@ -95,10 +99,6 @@ export default function Banquet() {
     banquet
       .reminders(60)
       .then((r) => setReminders(r.functions))
-      .catch((e) => setError(serverError(e)))
-    banquet
-      .pipeline({ months: 6 })
-      .then(setPipeline)
       .catch((e) => setError(serverError(e)))
     listResource("Venue Booking", {
       fields: [
@@ -124,6 +124,12 @@ export default function Banquet() {
       .catch((e) => setError(serverError(e)))
   }, [])
   useEffect(load, [load])
+  useEffect(() => {
+    banquet
+      .pipeline(fromDate && toDate ? { from_date: fromDate, to_date: toDate } : { months: 6 })
+      .then(setPipeline)
+      .catch((e) => setError(serverError(e)))
+  }, [fromDate, toDate])
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -217,7 +223,7 @@ export default function Banquet() {
                 : "border-transparent text-zinc-500 hover:text-zinc-800")
             }
           >
-            {label}
+            {translate(label)}
           </button>
         ))}
       </div>
@@ -229,7 +235,29 @@ export default function Banquet() {
         />
       )}
 
-      {tab === "pipeline" && <PipelineBoard data={pipeline} />}
+      {tab === "pipeline" && (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="date"
+              aria-label={t("From")}
+              className="rounded-lg border border-zinc-300 px-2 py-1.5 text-sm"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+            />
+            <span className="text-sm text-zinc-400">→</span>
+            <input
+              type="date"
+              aria-label={t("To")}
+              className="rounded-lg border border-zinc-300 px-2 py-1.5 text-sm"
+              value={toDate}
+              min={fromDate || undefined}
+              onChange={(e) => setToDate(e.target.value)}
+            />
+          </div>
+          <PipelineBoard data={pipeline} />
+        </>
+      )}
 
       {tab === "functions" && (
         <Card>
@@ -252,7 +280,7 @@ export default function Banquet() {
               >
                 <option value="">{t("All statuses")}</option>
                 {STATUSES.map((s) => (
-                  <option key={s}>{s}</option>
+                  <option key={s} value={s}>{translate(s)}</option>
                 ))}
               </select>
             </div>
@@ -304,7 +332,7 @@ export default function Banquet() {
                         </td>
                         <td className="py-2 pr-3 text-zinc-600">{r.venue}</td>
                         <td className="py-2 pr-3 text-zinc-600">
-                          {r.event_type}
+                          {translate(r.event_type)}
                         </td>
                         <td className="py-2 pr-3 text-right tabular-nums">
                           {r.pax_guaranteed || r.attendees || "-"}
@@ -408,7 +436,7 @@ function RemindersBoard({
                       (a.urgency === "high" ? "text-amber-800" : "text-zinc-500")
                     }
                   >
-                    {a.message}
+                    {translate(a.message)}
                   </li>
                 ))}
               </ul>
@@ -431,7 +459,7 @@ function RemindersBoard({
 /* ── month by month ───────────────────────────────────────────────────── */
 
 function PipelineBoard({ data }: { data: BanquetPipeline | null }) {
-  const { t } = useT()
+  const { t, tn } = useT()
   if (!data) return <Empty>{t("Loading…")}</Empty>
   const peak = Math.max(
     1,
@@ -470,11 +498,7 @@ function PipelineBoard({ data }: { data: BanquetPipeline | null }) {
                       )}
                       <span className="text-zinc-400">
                         {" "}
-                        · {t("{n} function{s} · {pax} pax", {
-                          n: m.count,
-                          s: m.count === 1 ? "" : "s",
-                          pax: m.pax,
-                        })}
+                        · {tn(m.count, "{n} function", "{n} functions")} · {t("{pax} pax", { pax: m.pax })}
                       </span>
                     </span>
                   </div>
@@ -541,7 +565,7 @@ function BreakdownCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{title}</CardTitle>
+        <CardTitle>{translate(title)}</CardTitle>
       </CardHeader>
       <CardContent>
         {rows.length === 0 ? (
@@ -617,7 +641,7 @@ function EnquirySheet({
     : (SESSION_HOURS[form.session] ?? ["", ""])
 
   useEffect(() => {
-    listResource("Company", { fields: ["name", "company_name"], limit: 200 })
+    listResource("Corporate Account", { fields: ["name", "company_name"], limit: 200 })
       .then(setCompanies)
       .catch(() => {})
   }, [])
@@ -782,7 +806,7 @@ function EnquirySheet({
           </Field>
           <Field
             label={t("Session")}
-            hint={custom ? undefined : `${from}–${to}`}
+            hint={translate(custom ? undefined : `${from}-${to}`)}
           >
             <Select
               value={form.session}
@@ -827,7 +851,7 @@ function EnquirySheet({
             <p className="text-sm text-zinc-400">{t("Checking…")}</p>
           ) : avail.length === 0 ? (
             <p className="text-sm text-zinc-500">
-              {t("No halls set up for this property yet — add one under Halls & Venues.")}
+              {t("No halls set up for this property yet - add one under Halls & Venues.")}
             </p>
           ) : (
             <div className="grid gap-2 sm:grid-cols-2">
@@ -855,8 +879,8 @@ function EnquirySheet({
                       </span>
                     </div>
                     <div className="mt-0.5 text-xs text-zinc-400">
-                      {v.venue_type} · {t("seats {n}", { n: v.capacity })}
-                      {v.hourly_rate ? ` · ${inr(v.hourly_rate)}/hr` : ""}
+                      {translate(v.venue_type)} · {t("seats {n}", { n: v.capacity })}
+                      {v.hourly_rate ? translate(" · {v0}/hr", { v0: String(inr(v.hourly_rate)) }) : ""}
                     </div>
                     {blocked && (
                       <div className="mt-1 text-xs text-rose-700">

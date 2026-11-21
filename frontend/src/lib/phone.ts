@@ -1,5 +1,12 @@
-/** Format property/host phone numbers for guest-facing pages.
- *  Always include an international dial code so guests can tap-to-call. */
+import {
+  Metadata,
+  getCountries,
+  getCountryCallingCode,
+  parsePhoneNumberFromString,
+} from "libphonenumber-js/core"
+import metadata from "libphonenumber-js/metadata.min.json"
+
+/** Format property/host phone numbers and support international guest numbers. */
 
 /**
  * Country (or ISO code) to international dial code. Keys are lower-cased and
@@ -133,204 +140,206 @@ const DIAL_BY_COUNTRY: Record<string, string> = {
   mu: "230",
   israel: "972",
   il: "972",
+  nigeria: "234",
+  ng: "234",
+  ethiopia: "251",
+  et: "251",
+  tanzania: "255",
+  tz: "255",
+
+  // Rest of the Arab world, with Arabic names (the desk UI ships in Arabic)
+  yemen: "967",
+  ye: "967",
+  "اليمن": "967",
+  jordan: "962",
+  jo: "962",
+  "الأردن": "962",
+  iraq: "964",
+  iq: "964",
+  "العراق": "964",
+  syria: "963",
+  sy: "963",
+  "سوريا": "963",
+  lebanon: "961",
+  lb: "961",
+  "لبنان": "961",
+  palestine: "970",
+  ps: "970",
+  "فلسطين": "970",
+  morocco: "212",
+  ma: "212",
+  "المغرب": "212",
+  algeria: "213",
+  dz: "213",
+  "الجزائر": "213",
+  tunisia: "216",
+  tn: "216",
+  "تونس": "216",
+  libya: "218",
+  ly: "218",
+  "ليبيا": "218",
+  sudan: "249",
+  sd: "249",
+  "السودان": "249",
+  "مصر": "20",
+  "السعودية": "966",
+  "الإمارات": "971",
+  "قطر": "974",
+  "الكويت": "965",
+  "عمان": "968",
+  "عُمان": "968",
+  "البحرين": "973",
+
+  // Rest of Asia
+  iran: "98",
+  ir: "98",
+  afghanistan: "93",
+  af: "93",
+  cambodia: "855",
+  kh: "855",
+  myanmar: "95",
+  mm: "95",
+  laos: "856",
+  la: "856",
 }
 
-/**
- * National-number digit counts per dial code, for the countries above.
- * A range covers countries where landline and mobile differ in length
- * (UK landlines run 9-10 digits, UAE 8-9); most are a single fixed length.
- * Counts exclude the dial code and any trunk "0".
- */
-const LENGTH_BY_DIAL: Record<string, { min: number; max: number }> = {
-  // South Asia
-  "91": { min: 10, max: 10 }, // India
-  "977": { min: 8, max: 10 }, // Nepal - 8 landline, 10 mobile
-  "94": { min: 9, max: 9 }, // Sri Lanka
-  "880": { min: 9, max: 10 }, // Bangladesh
-  "960": { min: 7, max: 7 }, // Maldives
-  "975": { min: 8, max: 8 }, // Bhutan
-  "92": { min: 10, max: 10 }, // Pakistan
-
-  // Gulf
-  "971": { min: 8, max: 9 }, // UAE - incl. Dubai, Abu Dhabi
-  "966": { min: 9, max: 9 }, // Saudi Arabia
-  "974": { min: 8, max: 8 }, // Qatar
-  "968": { min: 8, max: 8 }, // Oman
-  "965": { min: 8, max: 8 }, // Kuwait
-  "973": { min: 8, max: 8 }, // Bahrain
-
-  // Americas
-  "1": { min: 10, max: 10 }, // US / Canada
-  "52": { min: 10, max: 10 }, // Mexico
-  "55": { min: 10, max: 11 }, // Brazil
-
-  // Europe
-  "44": { min: 9, max: 10 }, // UK
-  "353": { min: 7, max: 9 }, // Ireland
-  "49": { min: 6, max: 11 }, // Germany - unusually variable
-  "33": { min: 9, max: 9 }, // France
-  "39": { min: 9, max: 11 }, // Italy
-  "34": { min: 9, max: 9 }, // Spain
-  "351": { min: 9, max: 9 }, // Portugal
-  "31": { min: 9, max: 9 }, // Netherlands
-  "32": { min: 8, max: 9 }, // Belgium
-  "41": { min: 9, max: 9 }, // Switzerland
-  "43": { min: 7, max: 13 }, // Austria - unusually variable
-  "46": { min: 7, max: 9 }, // Sweden
-  "47": { min: 8, max: 8 }, // Norway
-  "45": { min: 8, max: 8 }, // Denmark
-  "48": { min: 9, max: 9 }, // Poland
-  "30": { min: 10, max: 10 }, // Greece
-  "7": { min: 10, max: 10 }, // Russia / Kazakhstan
-  "90": { min: 10, max: 10 }, // Turkey
-
-  // Asia-Pacific
-  "86": { min: 10, max: 11 }, // China
-  "852": { min: 8, max: 8 }, // Hong Kong
-  "81": { min: 9, max: 10 }, // Japan
-  "82": { min: 9, max: 10 }, // South Korea
-  "66": { min: 8, max: 9 }, // Thailand
-  "60": { min: 9, max: 10 }, // Malaysia
-  "62": { min: 9, max: 12 }, // Indonesia
-  "84": { min: 9, max: 9 }, // Vietnam
-  "63": { min: 10, max: 10 }, // Philippines
-  "65": { min: 8, max: 8 }, // Singapore
-  "61": { min: 9, max: 9 }, // Australia
-  "64": { min: 8, max: 10 }, // New Zealand
-
-  // Africa and Middle East
-  "27": { min: 9, max: 9 }, // South Africa
-  "254": { min: 9, max: 9 }, // Kenya
-  "20": { min: 10, max: 10 }, // Egypt
-  "230": { min: 7, max: 8 }, // Mauritius
-  "972": { min: 9, max: 9 }, // Israel
+/** Resolve every supported country, retaining the existing city/name aliases. */
+const countries = getCountries(metadata)
+for (const language of ["en", "es", "ar", "pt"]) {
+  const names = new Intl.DisplayNames([language], { type: "region" })
+  for (const country of countries) {
+    const dial = getCountryCallingCode(country, metadata)
+    DIAL_BY_COUNTRY[country.toLowerCase()] = dial
+    const name = names.of(country)
+    if (name) DIAL_BY_COUNTRY[name.toLowerCase()] = dial
+  }
 }
 
-/** E.164 caps a full number at 15 digits, so an unlisted code gets the slack. */
-const DEFAULT_LENGTH = { min: 4, max: 15 }
+/** All country and international-service calling codes, independent of the hotel. */
+export const PHONE_DIAL_CODES = [
+  ...new Set([
+    ...countries.map((country) => getCountryCallingCode(country, metadata)),
+    ...Object.keys(metadata.nonGeographic ?? {}),
+  ]),
+].sort((a, b) => Number(a) - Number(b))
 
-/** How many digits the local part may have, for a given dial code. */
+const dialPrefixes = [...PHONE_DIAL_CODES].sort((a, b) => b.length - a.length)
+const lengthsByDial = new Map<string, Set<number>>()
+const plans = new Metadata(metadata)
+for (const country of countries) {
+  const dial = getCountryCallingCode(country, metadata)
+  plans.selectNumberingPlan(country)
+  const lengths = lengthsByDial.get(dial) ?? new Set<number>()
+  for (const length of plans.numberingPlan?.possibleLengths() ?? []) {
+    // E.164 permits at most 15 digits including the calling code.
+    if (length + dial.length <= 15) lengths.add(length)
+  }
+  lengthsByDial.set(dial, lengths)
+}
+
+/** How many digits the national part may have, including shared calling codes. */
 export function phoneLengthForDial(dial: string): { min: number; max: number } {
-  const spec = LENGTH_BY_DIAL[dial]
-  if (spec) return spec
-  const room = 15 - dial.length
-  return { min: DEFAULT_LENGTH.min, max: Math.min(DEFAULT_LENGTH.max, room) }
+  const lengths = lengthsByDial.get(dial)
+  if (lengths?.size) return { min: Math.min(...lengths), max: Math.max(...lengths) }
+  return { min: 4, max: 15 - dial.length }
 }
 
 export function dialForCountry(country?: string | null): string {
-  const key = (country || "India").trim().toLowerCase()
-  return DIAL_BY_COUNTRY[key] || "91"
+  const key = (country ?? "").trim().toLowerCase()
+  // An unrecognised country must not silently assign an Indian phone number.
+  return DIAL_BY_COUNTRY[key] ?? ""
 }
 
-/** Digits only, drop a leading trunk 0. */
+/** Keep significant leading zeros, for example on Italian landline numbers. */
 function digitsOnly(raw: string): string {
-  return raw.replace(/\D/g, "").replace(/^0+/, "")
+  return raw.replace(/\D/g, "")
+}
+
+function knownDialPrefix(digits: string): string | undefined {
+  return dialPrefixes.find((dial) => digits.startsWith(dial))
+}
+
+function parsedInternational(dial: string, local: string) {
+  if (!dial || !local) return undefined
+  return parsePhoneNumberFromString(`+${dial}${local}`, { extract: false }, metadata)
 }
 
 /**
- * Display form, e.g. `+91 91488 69914`.
- * Leaves numbers that already start with `+` intact (normalized spacing).
- */
-export function formatPhoneDisplay(
-  phone: string | null | undefined,
-  country?: string | null,
-): string {
-  if (!phone?.trim()) return ""
-  const raw = phone.trim()
-  if (raw.startsWith("+")) {
-    const rest = digitsOnly(raw.slice(1))
-    if (!rest) return raw
-    // +91XXXXXXXXXX → +91 XXXXX XXXXX-ish grouping by country code length
-    if (rest.length > 10) {
-      const cc = rest.slice(0, rest.length - 10)
-      const local = rest.slice(-10)
-      return `+${cc} ${local.slice(0, 5)} ${local.slice(5)}`
-    }
-    return `+${rest}`
-  }
-  const dial = dialForCountry(country)
-  let local = digitsOnly(raw)
-  // Strip an embedded country code, e.g. "919876543210" -> "9876543210".
-  // Guard on length > 10: a plain 10-digit local number (India) can itself
-  // start with "91" (e.g. 9876543210) and must NOT be stripped.
-  if (local.length > 10 && local.startsWith(dial)) {
-    local = local.slice(dial.length)
-  }
-  if (local.length === 10) {
-    return `+${dial} ${local.slice(0, 5)} ${local.slice(5)}`
-  }
-  return `+${dial} ${local}`
-}
-
-/** tel: href value, e.g. `+919876543210`. */
-export function formatPhoneTel(
-  phone: string | null | undefined,
-  country?: string | null,
-): string {
-  if (!phone?.trim()) return ""
-  const raw = phone.trim()
-  if (raw.startsWith("+")) {
-    return `+${digitsOnly(raw.slice(1))}`
-  }
-  const dial = dialForCountry(country)
-  let local = digitsOnly(raw)
-  if (local.length > 10 && local.startsWith(dial)) {
-    local = local.slice(dial.length)
-  }
-  return `+${dial}${local}`
-}
-
-/**
- * Split a stored number into its dial code and the local part, for inputs that
- * render the code as a fixed prefix. Falls back to the property's country when
- * the stored value carries no code of its own.
+ * An explicit +/00 code always belongs to the phone, even at a hotel abroad.
+ * Only numbers without their own code use the property's country as a default.
  */
 export function splitPhone(
   phone: string | null | undefined,
   country?: string | null,
 ): { dial: string; local: string } {
-  const dial = dialForCountry(country)
-  const raw = (phone || "").trim()
-  if (!raw) return { dial, local: "" }
-  if (raw.startsWith("+")) {
-    // joinPhone always writes a leading "+", so the code here is unambiguous
-    // even mid-typing: "+919" is a 1-digit local number, not "919".
-    const digits = digitsOnly(raw.slice(1))
-    return {
-      dial,
-      local: digits.startsWith(dial) ? digits.slice(dial.length) : digits,
-    }
+  const raw = (phone ?? "").trim()
+  const defaultDial = dialForCountry(country)
+  if (!raw) return { dial: defaultDial, local: "" }
+  if (raw.startsWith("+") || raw.startsWith("00")) {
+    const digits = digitsOnly(raw.slice(raw.startsWith("+") ? 1 : 2))
+    const dial = knownDialPrefix(digits)
+    // Preserve an unrecognised international number for correction rather than
+    // attaching the hotel's code and changing the number's destination.
+    if (!dial) return { dial: "", local: digits }
+    const local = digits.slice(dial.length)
+    return { dial, local: parsedInternational(dial, local)?.nationalNumber ?? local }
   }
-  // stored without a code: only strip one that sits in front of a full local
-  // number, since a 10-digit Indian number can itself start with "91"
-  const digits = digitsOnly(raw)
-  if (digits.length > 10 && digits.startsWith(dial)) {
-    return { dial, local: digits.slice(dial.length) }
+  let local = digitsOnly(raw)
+  const { min, max } = phoneLengthForDial(defaultDial)
+  // Legacy values may contain a country code without a leading +. Strip it
+  // only when the complete value is too long to be a national number.
+  if (defaultDial && local.startsWith(defaultDial) && local.length > max) {
+    const national = local.slice(defaultDial.length)
+    if (national.length >= min && national.length <= max) local = national
   }
-  return { dial, local: digits }
+  return {
+    dial: defaultDial,
+    local: parsedInternational(defaultDial, local)?.nationalNumber ?? local,
+  }
 }
 
-/** Recombine a prefixed input back into storage form, e.g. `+919876543210`. */
+/** Recombine a selected calling code and national number for storage. */
 export function joinPhone(dial: string, local: string): string {
   const digits = digitsOnly(local)
-  return digits ? `+${dial}${digits}` : ""
+  if (!digits) return ""
+  return parsedInternational(dial, digits)?.number ?? (dial ? `+${dial}${digits}` : digits)
 }
 
-/** Trim a local part to the most digits its country allows. */
-export function clampLocal(local: string, dial: string): string {
-  return digitsOnly(local).slice(0, phoneLengthForDial(dial).max)
+/** Display the correct international grouping for the number's own country. */
+export function formatPhoneDisplay(
+  phone: string | null | undefined,
+  country?: string | null,
+): string {
+  if (!phone?.trim()) return ""
+  const { dial, local } = splitPhone(phone, country)
+  const parsed = parsedInternational(dial, local)
+  if (parsed?.isPossible()) return parsed.formatInternational()
+  if (dial) return `+${dial}${local ? ` ${local}` : ""}`
+  return phone.trim()
 }
 
-/**
- * Is this a complete number for its country? Empty counts as valid: phone is
- * optional on a booking, so only a half-typed number should block anything.
- */
+/** tel: href value, retaining a foreign number's own calling code. */
+export function formatPhoneTel(
+  phone: string | null | undefined,
+  country?: string | null,
+): string {
+  if (!phone?.trim()) return ""
+  const { dial, local } = splitPhone(phone, country)
+  if (dial) return joinPhone(dial, local)
+  const raw = phone.trim()
+  if (raw.startsWith("+") || raw.startsWith("00")) {
+    return `+${digitsOnly(raw.slice(raw.startsWith("+") ? 1 : 2))}`
+  }
+  return digitsOnly(raw)
+}
+
+/** Phone is optional; a supplied number must fit its own calling code. */
 export function isPhoneComplete(
   phone: string | null | undefined,
   country?: string | null,
 ): boolean {
+  if (!phone?.trim()) return true
   const { dial, local } = splitPhone(phone, country)
-  if (!local) return true
-  const { min, max } = phoneLengthForDial(dial)
-  return local.length >= min && local.length <= max
+  if (!dial || !local || dial.length + local.length > 15) return false
+  return parsedInternational(dial, local)?.isPossible() ?? false
 }

@@ -10,6 +10,8 @@
   "column_break_a",
   "business_date",
   "terminal",
+  "cashier_terminal",
+  "outlet",
   "status",
   "sb_cash",
   "opening_float",
@@ -23,7 +25,10 @@
   "petty_cash",
   "expected_cash",
   "counted_cash",
+  "cash_count",
   "variance",
+  "variance_status",
+  "variance_approved_by",
   "sb_meta",
   "opened_at",
   "closed_at",
@@ -189,11 +194,47 @@
    "fieldname": "close_notes",
    "fieldtype": "Small Text",
    "label": "Close Notes"
+  },
+  {
+   "fieldname": "cashier_terminal",
+   "fieldtype": "Link",
+   "label": "Cashier Terminal",
+   "options": "Cashier Terminal",
+   "in_list_view": 0,
+   "description": "Empty means the property's Default till (every session opened before terminals existed)."
+  },
+  {
+   "fieldname": "outlet",
+   "fieldtype": "Link",
+   "label": "POS Outlet",
+   "options": "POS Outlet",
+   "read_only": 1
+  },
+  {
+   "fieldname": "variance_status",
+   "fieldtype": "Select",
+   "label": "Variance Review",
+   "options": "\nNeeds Review\nApproved",
+   "read_only": 1
+  },
+  {
+   "fieldname": "variance_approved_by",
+   "fieldtype": "Link",
+   "label": "Variance Approved By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cash_count",
+   "fieldtype": "JSON",
+   "label": "Cash Count",
+   "read_only": 1,
+   "description": "The drawer counted note by note at close: value, count and amount per denomination."
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-09-07 00:00:00",
+ "modified": "2026-11-12 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Kamra",
  "name": "Cashier Session",
@@ -250,6 +291,12 @@
    "print": 1,
    "report": 1,
    "email": 1
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "print": 1,
+   "role": "Night Auditor"
   }
  ],
  "sort_field": "modified",

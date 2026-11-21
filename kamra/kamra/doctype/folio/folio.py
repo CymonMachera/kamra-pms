@@ -9,6 +9,20 @@ from frappe.model.document import Document
 class Folio(Document):
 	def validate(self):
 		self.guard_closed()
+		self.stamp_payment_currency()
+		from kamra.ledger import stamp_gl_codes
+		stamp_gl_codes(self)
+
+	def stamp_payment_currency(self):
+		"""Every payment row carries the property's currency unless a writer
+		set one (FX rows do). One guard here covers all writers (#341)."""
+		missing = [p for p in self.payments if not p.currency]
+		if missing:
+			from kamra.localization import default_currency, pack_for
+			cur = (frappe.get_cached_value("Property", self.property, "currency")
+			       or default_currency(pack_for(self.property)))
+			for p in missing:
+				p.currency = cur
 
 	def guard_closed(self):
 		"""Once the GST invoice number is assigned the bill is frozen:

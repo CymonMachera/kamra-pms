@@ -7,14 +7,14 @@ the four Opera ledgers (Guest / Deposit / AR / Package) can be balanced."""
 from __future__ import annotations
 
 import json
+from decimal import ROUND_HALF_UP, ROUND_UP, Decimal
 from typing import Any
 
 import frappe
-from frappe.utils import now_datetime, nowdate
+from frappe.utils import getdate, now_datetime, nowdate
 
 from kamra.authz import require_roles
 from kamra.business_date import get_business_date
-
 
 CHARGE_TYPE_TO_CODE = {
 	"Room": ("1000", "Room Charge", "Rooms", "Room"),
@@ -23,12 +23,29 @@ CHARGE_TYPE_TO_CODE = {
 	"Minibar": ("2100", "Minibar", "F&B", "Minibar"),
 	"Laundry": ("3000", "Laundry", "Other", "Laundry"),
 	"Spa": ("3100", "Spa", "Other", "Spa"),
+	"Taxi": ("3200", "Taxi", "Other", "Taxi"),
 	"Early Check-in": ("1200", "Early Check-in", "Rooms", "Early Check-in"),
 	"Late Checkout": ("1210", "Late Checkout", "Rooms", "Late Checkout"),
+	# the charge for booked nights a guest leaving early did not use: earned
+	# income, but not a night sold, so it stays out of room revenue (ADR,
+	# RevPAR) and sits with other income
+	"Early Departure": ("1220", "Early Departure", "Other", "Early Departure"),
 	"Cleaning Fee": ("1300", "Cleaning Fee", "Rooms", "Cleaning Fee"),
+	# extra beds in a let room - room revenue, so it lands in the Rooms group
+	"Extra Guests": ("1320", "Extra Guests", "Rooms", "Extra Guests"),
+	"Pet Charge": ("1330", "Pet Charge", "Rooms", "Pet Charge"),
+	# collected for the municipality / city - a levy, not hotel revenue
+	"Room Levy": ("1310", "Room Levy", "Levies", "Room Levy"),
+	# a later rate change or correction on a night already charged: room
+	# revenue, posted on the business date (folio.post_rate_lines)
+	"Rate Adjustment": ("1010", "Room Rate Adjustment", "Rooms", "Rate Adjustment"),
 	"Discount": ("9000", "Discount", "Adjustment", "Discount"),
 	"Misc": ("8000", "Miscellaneous", "Other", "Misc"),
 	"Allowance": ("9100", "Allowance", "Adjustment", "Allowance"),
+	# a balance carried over from the previous PMS at go-live (kamra.golive):
+	# not revenue of the day - the old system already counted it
+	"Opening Balance": ("8900", "Opening Balance (go-live)", "Opening Balance",
+	                    "Opening Balance"),
 }
 
 PAYMENT_CODES = {
@@ -48,8 +65,9 @@ def ensure_default_transaction_codes(property: str | None = None) -> None:
 			"code": code,
 			"description": desc,
 			"property": property,
-			"txn_type": "Adjustment" if charge_type in ("Discount", "Allowance")
-			            else "Revenue",
+			"txn_type": "Adjustment" if charge_type in (
+				"Discount", "Allowance", "Opening Balance")
+			            else "Tax" if charge_type == "Room Levy" else "Revenue",
 			"revenue_group": group,
 			"subgroup": charge_type,
 			"charge_type": charge_type,
@@ -78,6 +96,49 @@ def code_for_charge_type(charge_type: str) -> str | None:
 	return code if frappe.db.exists("Transaction Code", code) else None
 
 
+def payment_code_for(kind: str | None, mode: str | None) -> str | None:
+	"""The Transaction Code a payment books to: a Payment code set up for
+	its mode (Cash, Card, ...) when there is one, else the code of its kind."""
+	if mode:
+		code = frappe.db.get_value(
+			"Transaction Code",
+			{"txn_type": "Payment", "payment_mode": mode, "disabled": 0}, "name")
+		if code:
+			return code
+	meta = PAYMENT_CODES.get(kind or "Payment")
+	if not meta:
+		return None
+	if not frappe.db.exists("Transaction Code", meta[0]):
+		ensure_default_transaction_codes()
+	return meta[0] if frappe.db.exists("Transaction Code", meta[0]) else None
+
+
+def gl_code_of(code: str | None) -> str | None:
+	return (frappe.db.get_value("Transaction Code", code, "gl_code") or None) if code else None
+
+
+def stamp_gl_codes(folio_doc) -> None:
+	"""Give each newly posted charge and payment its Transaction Code and
+	that code's GL code (#532). Lines already saved keep what they were
+	posted with, so changing a code's GL later never rewrites history."""
+	old = None if folio_doc.is_new() else folio_doc.get_doc_before_save()
+	posted = {r.name for r in [*old.charges, *old.payments]} if old else set()
+	for c in folio_doc.charges:
+		if c.name in posted:
+			continue
+		if not c.transaction_code:
+			c.transaction_code = code_for_charge_type(c.charge_type or "Misc")
+		if not c.gl_code:
+			c.gl_code = gl_code_of(c.transaction_code)
+	for p in folio_doc.payments:
+		if p.name in posted:
+			continue
+		if not p.transaction_code:
+			p.transaction_code = payment_code_for(p.payment_kind, p.mode)
+		if not p.gl_code:
+			p.gl_code = gl_code_of(p.transaction_code)
+
+
 def write_ledger_entry(
 	*,
 	property: str,
@@ -92,8 +153,13 @@ def write_ledger_entry(
 	reversal_of: str | None = None,
 	source_doctype: str | None = None,
 	source_name: str | None = None,
+	business_date: str | None = None,
 ) -> str:
-	bd = get_business_date(property)
+	"""The one Folio Ledger Entry writer. `business_date` defaults to the
+	property's current business date; only a backfill passes its own
+	(and needs backdate permission or allow_past_transaction)."""
+	from kamra.business_date import assert_transaction_date
+	bd = assert_transaction_date(property, business_date, label="Business date")
 	doc = frappe.get_doc({
 		"doctype": "Folio Ledger Entry",
 		"property": property,
@@ -116,7 +182,9 @@ def write_ledger_entry(
 	return doc.name
 
 
-def record_charge_ledger(folio_doc, charge_row, session: str | None = None):
+def record_charge_ledger(folio_doc, charge_row, session: str | None = None,
+                         business_date: str | None = None,
+                         reversal_of: str | None = None):
 	code = charge_row.get("transaction_code") or code_for_charge_type(
 		charge_row.get("charge_type") or "Misc")
 	amt = float(charge_row.get("total") or charge_row.get("amount") or 0)
@@ -130,19 +198,65 @@ def record_charge_ledger(folio_doc, charge_row, session: str | None = None):
 		description=charge_row.get("description") or charge_row.get("charge_type"),
 		transaction_code=code,
 		session=session,
+		reversal_of=reversal_of,
 		source_doctype="Folio Charge",
 		source_name=charge_row.get("name"),
+		business_date=business_date,
 	)
 
 
-def record_payment_ledger(folio_doc, payment_row, session: str | None = None):
+def unsaved_charges(folio_doc) -> list:
+	"""Charge rows appended since the folio was loaded (no name yet). Take
+	this before save; after save the same row objects carry their names."""
+	return [c for c in folio_doc.charges if not c.name]
+
+
+def ledger_charges(folio_doc, rows, session: str | None = None) -> None:
+	"""Post saved charge rows to the Guest ledger through
+	record_charge_ledger - the path for automatic postings (room nights,
+	meal plans, levies, policy fees, cleaning fees, add-ons, POS). A row
+	already on the ledger is skipped, so a caller can never double post.
+	Like a manual charge, a ledger failure is logged, not raised: the
+	folio line stands and the backfill patch can pick it up."""
+	for row in rows:
+		if not row.name:
+			continue
+		if frappe.db.exists("Folio Ledger Entry", {
+				"source_doctype": "Folio Charge", "source_name": row.name,
+				"folio": folio_doc.name}):
+			continue
+		try:
+			record_charge_ledger(folio_doc, row.as_dict(), session=session)
+		except Exception:
+			frappe.log_error(title="ledger charge write failed")
+
+
+def save_folio(folio_doc, session: str | None = None) -> None:
+	"""Save (or insert) a folio and post any newly appended charge rows to
+	the ledger."""
+	new_rows = unsaved_charges(folio_doc)
+	if folio_doc.is_new():
+		folio_doc.insert(ignore_permissions=True)
+	else:
+		folio_doc.save(ignore_permissions=True)
+	ledger_charges(folio_doc, new_rows, session=session)
+
+
+def record_payment_ledger(folio_doc, payment_row, session: str | None = None,
+                          ledger: str | None = None):
+	"""ledger overrides where the row lands: a security-deposit refund is
+	stored as a Refund row on the folio but releases the Deposit ledger
+	(the liability), not the Guest ledger."""
 	kind = payment_row.get("payment_kind") or "Payment"
-	code_meta = PAYMENT_CODES.get(kind)
-	code = code_meta[0] if code_meta else None
-	if code and not frappe.db.exists("Transaction Code", code):
-		ensure_default_transaction_codes()
+	code = payment_row.get("transaction_code")
+	if not code:
+		code_meta = PAYMENT_CODES.get(kind)
+		code = code_meta[0] if code_meta else None
+		if code and not frappe.db.exists("Transaction Code", code):
+			ensure_default_transaction_codes()
 	amt = float(payment_row.get("amount") or 0)
-	ledger = "Deposit" if kind in ("Advance", "Security Deposit") else "Guest"
+	ledger = ledger or ("Deposit" if kind in ("Advance", "Security Deposit")
+	                    else "Guest")
 	# Payments credit the ledger (reduce what guest owes / increase liability)
 	write_ledger_entry(
 		property=folio_doc.property,
@@ -158,29 +272,97 @@ def record_payment_ledger(folio_doc, payment_row, session: str | None = None):
 	)
 
 
-def reverse_ledger_for_charge(property: str, folio: str, charge_row_name: str,
-                              reason: str = "") -> str | None:
-	"""Find the original ledger entry for a charge and post a reversal."""
-	orig = frappe.db.get_value(
+ADVANCE_APPLIED = "Advance applied to the stay"
+
+
+def _advance_held(folio: str, payment_row: str) -> float:
+	"""What of one Advance payment still sits in the Deposit ledger."""
+	return round(float(frappe.db.sql(
+		"""SELECT COALESCE(SUM(credit - debit), 0) FROM `tabFolio Ledger Entry`
+		   WHERE ledger = 'Deposit' AND source_doctype = 'Folio Payment'
+		     AND source_name = %s AND folio = %s""",
+		(payment_row, folio))[0][0] or 0), 2)
+
+
+def transfer_advances_to_guest(reservation: str,
+                               business_date: str | None = None) -> float:
+	"""An advance is a liability (Deposit ledger) only until the guest is in
+	house. From check-in it pays the stay, so each Advance payment moves out
+	of the Deposit ledger and credits the Guest ledger - the same two legs
+	as a security deposit applied to the bill (deposit._transfer_to_guest).
+
+	Idempotent per payment: only what is still held for that payment row
+	moves, so calling it again (check-in, a later advance, check-out, the
+	backfill patch) never moves money twice. Returns the amount moved."""
+	code = PAYMENT_CODES["Advance"][0]
+	if not frappe.db.exists("Transaction Code", code):
+		ensure_default_transaction_codes()
+	if not frappe.db.exists("Transaction Code", code):
+		code = None
+	moved = 0.0
+	for folio in frappe.get_all("Folio", filters={"reservation": reservation},
+	                            fields=["name", "property"]):
+		for row in frappe.get_all(
+				"Folio Payment",
+				filters={"parent": folio.name, "parenttype": "Folio",
+				         "payment_kind": "Advance"},
+				pluck="name"):
+			held = _advance_held(folio.name, row)
+			if held <= 0.005:
+				continue
+			for ledger, debit, credit in (("Deposit", held, 0),
+			                              ("Guest", 0, held)):
+				write_ledger_entry(
+					property=folio.property, folio=folio.name, ledger=ledger,
+					debit=debit, credit=credit, description=ADVANCE_APPLIED,
+					transaction_code=code, source_doctype="Folio Payment",
+					source_name=row, business_date=business_date)
+			moved += held
+	return moved
+
+
+def _charge_ledger_net(folio: str, charge_row_name: str) -> float:
+	return float(frappe.db.sql(
+		"""SELECT COALESCE(SUM(debit - credit), 0) FROM `tabFolio Ledger Entry`
+		   WHERE source_doctype = 'Folio Charge' AND source_name = %s
+		     AND folio = %s""", (charge_row_name, folio))[0][0] or 0)
+
+
+def _original_charge_entry(folio: str, charge_row_name: str):
+	return frappe.db.get_value(
 		"Folio Ledger Entry",
 		{"source_doctype": "Folio Charge", "source_name": charge_row_name,
 		 "folio": folio, "reversal_of": ["in", ["", None]]},
 		["name", "debit", "credit", "transaction_code", "description", "ledger"],
 		as_dict=True,
 	)
-	# Also skip if already reversed
-	if orig and frappe.db.exists("Folio Ledger Entry", {"reversal_of": orig.name}):
-		return None
+
+
+def reverse_ledger_for_charge(property: str, folio: str, charge_row_name: str,
+                              reason: str = "", amount: float | None = None,
+                              prefix: str = "VOID") -> str | None:
+	"""Post a reversal against a charge's ledger entry. By default it
+	reverses what is still on the ledger for the line (a line partly split
+	away only reverses its remainder); `amount` reverses part of it (a
+	split). Returns None when there is nothing left to reverse."""
+	orig = _original_charge_entry(folio, charge_row_name)
 	if not orig:
 		# Soft fallback: no original entry (pre-ledger data)
 		return None
+	net = _charge_ledger_net(folio, charge_row_name)
+	if amount is not None:
+		# a part of a debit line (or of a credit line, sign kept)
+		net = abs(float(amount)) if net >= 0 else -abs(float(amount))
+	net = round(net, 2)
+	if abs(net) < 0.005:
+		return None  # already fully reversed
 	return write_ledger_entry(
 		property=property,
 		folio=folio,
 		ledger=orig.ledger or "Guest",
-		debit=float(orig.credit or 0),
-		credit=float(orig.debit or 0),
-		description=f"VOID: {reason or orig.description or ''}"[:140],
+		debit=-net if net < 0 else 0,
+		credit=net if net > 0 else 0,
+		description=f"{prefix}: {reason or orig.description or ''}"[:140],
 		transaction_code=orig.transaction_code,
 		reversal_of=orig.name,
 		source_doctype="Folio Charge",
@@ -189,7 +371,7 @@ def reverse_ledger_for_charge(property: str, folio: str, charge_row_name: str,
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Front Desk", "Hotel Admin", "Kamra Agent")
+@require_roles("Finance", "Front Desk", "Hotel Admin", "Night Auditor", "Kamra Agent")
 def ledger_balances(property: str, business_date: str | None = None):
 	"""Four-ledger trial balance for a property (optionally as-of a date)."""
 	date = business_date or get_business_date(property)
@@ -216,19 +398,117 @@ def ledger_balances(property: str, business_date: str | None = None):
 		})
 	total_debit = sum(v["debit"] for v in ledgers.values())
 	total_credit = sum(v["credit"] for v in ledgers.values())
+	# These four are subsidiary (control) ledgers, not a full double-entry
+	# book: a charge debits Guest and its revenue side lives in the GL the
+	# accounting export feeds, a payment credits Guest and the cash side is
+	# the cashier's. So total debits exceed total credits by exactly what
+	# guests owe - comparing the two flagged every hotel with an open bill.
+	# The real test of these ledgers is that they agree with the bills they
+	# summarise: each folio's Guest + Deposit postings net to its balance.
+	recon = folio_reconciliation(property) if str(date) >= str(
+		get_business_date(property)) else None
 	return {
 		"business_date": date,
 		"ledgers": [ledgers[k] for k in ("Guest", "Deposit", "AR", "Package")],
 		"total_debit": total_debit,
 		"total_credit": total_credit,
-		"in_balance": abs(total_debit - total_credit) < 0.02,
+		# true / false from the folio check; null for a past date, where
+		# today's folio balances cannot be compared with the old ledger
+		"in_balance": recon["in_balance"] if recon else None,
+		"reconciliation": recon,
 	}
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Front Desk", "Hotel Admin", "Kamra Agent")
-def journal_by_transaction_code(property: str, business_date: str | None = None):
+@require_roles("Finance", "Front Desk", "Hotel Admin", "Night Auditor", "Kamra Agent")
+def ledger_detail(property: str, ledger: str, business_date: str | None = None,
+                  limit: int = 2000):
+	"""The drill-down under a ledger card: every folio with a balance in that
+	ledger as of the date (guest, booking, status, company), biggest first.
+	For AR the company the bill is billed to comes with it."""
+	if ledger not in ("Guest", "Deposit", "AR", "Package"):
+		frappe.throw(frappe._("Unknown ledger {0}.").format(ledger))
+	from kamra.authz import assert_property_access
+	assert_property_access(property)
 	date = business_date or get_business_date(property)
+	limit = max(1, min(int(limit or 2000), 2000))
+	rows = frappe.db.sql(
+		"""
+		SELECT e.folio, SUM(e.debit) AS debit, SUM(e.credit) AS credit,
+		       SUM(e.debit - e.credit) AS balance, MAX(e.business_date) AS last_date,
+		       f.guest_name, f.folio_type, f.status AS folio_status, f.invoice_number,
+		       r.name AS reservation, r.status AS stay_status, r.company
+		FROM `tabFolio Ledger Entry` e
+		LEFT JOIN `tabFolio` f ON f.name = e.folio
+		LEFT JOIN `tabReservation` r ON r.name = f.reservation
+		WHERE e.property = %(p)s AND e.ledger = %(l)s AND e.business_date <= %(d)s
+		GROUP BY e.folio
+		HAVING ABS(SUM(e.debit - e.credit)) >= 0.01
+		ORDER BY ABS(SUM(e.debit - e.credit)) DESC
+		LIMIT %(n)s
+		""", {"p": property, "l": ledger, "d": date, "n": limit + 1}, as_dict=True)
+	truncated = len(rows) > limit
+	rows = rows[:limit]
+	return {"ledger": ledger, "business_date": str(date), "truncated": truncated, "rows": [{
+		**r, "debit": round(float(r.debit), 2), "credit": round(float(r.credit), 2),
+		"balance": round(float(r.balance), 2), "last_date": str(r.last_date)}
+		for r in rows]}
+
+
+def folio_reconciliation(property: str, limit: int = 20) -> dict:
+	"""Guest + Deposit ledger postings per folio against the folio's own
+	balance (charges less payments). A folio whose ledger nets to something
+	else - a posting that never reached the ledger, or one the folio lost -
+	is a genuine break; the rest is money guests owe, not an imbalance."""
+	rows = frappe.db.sql(
+		"""
+		SELECT f.name AS folio, f.folio_type, f.status,
+		       COALESCE(f.balance, 0) AS balance,
+		       COALESCE(e.net, 0) AS ledger
+		FROM `tabFolio` f
+		LEFT JOIN (
+			SELECT folio, SUM(debit - credit) AS net
+			FROM `tabFolio Ledger Entry`
+			WHERE property = %(p)s AND ledger IN ('Guest', 'Deposit')
+			GROUP BY folio
+		) e ON e.folio = f.name
+		WHERE f.property = %(p)s
+		  AND ABS(COALESCE(f.balance, 0) - COALESCE(e.net, 0)) >= 0.02
+		ORDER BY f.creation DESC
+		""", {"p": property}, as_dict=True)
+	ledger_net = float(frappe.db.sql(
+		"""SELECT COALESCE(SUM(debit - credit), 0) FROM `tabFolio Ledger Entry`
+		   WHERE property = %s AND ledger IN ('Guest', 'Deposit')""",
+		property)[0][0] or 0)
+	folios_net = float(frappe.db.sql(
+		"""SELECT COALESCE(SUM(balance), 0) FROM `tabFolio`
+		   WHERE property = %s""", property)[0][0] or 0)
+	return {
+		"in_balance": not rows,
+		"ledger_net": round(ledger_net, 2),
+		"folios_net": round(folios_net, 2),
+		"difference": round(sum(float(r.balance) - float(r.ledger)
+		                        for r in rows), 2),
+		"folios_out": len(rows),
+		"folios": [{"folio": r.folio, "folio_type": r.folio_type,
+		            "status": r.status, "balance": round(float(r.balance), 2),
+		            "ledger": round(float(r.ledger), 2),
+		            "difference": round(float(r.balance) - float(r.ledger), 2)}
+		           for r in rows[:limit]],
+	}
+
+
+@frappe.whitelist()
+@require_roles("Finance", "Front Desk", "Hotel Admin", "Night Auditor", "Kamra Agent")
+def journal_by_transaction_code(property: str, business_date: str | None = None,
+                                from_date: str | None = None, to_date: str | None = None):
+	"""Ledger postings summed by transaction code: for one business date, or
+	from_date to to_date (both inclusive) when a range is given."""
+	date = business_date or get_business_date(property)
+	start = getdate(from_date) if from_date else getdate(date)
+	end = getdate(to_date) if to_date else getdate(date)
+	if start > end:
+		frappe.throw(frappe._("The start date is after the end date."))
 	rows = frappe.db.sql(
 		"""
 		SELECT COALESCE(transaction_code, '—') AS transaction_code,
@@ -236,16 +516,16 @@ def journal_by_transaction_code(property: str, business_date: str | None = None)
 		       COALESCE(SUM(credit), 0) AS credit,
 		       COUNT(*) AS entries
 		FROM `tabFolio Ledger Entry`
-		WHERE property = %(property)s AND business_date = %(date)s
+		WHERE property = %(property)s AND business_date BETWEEN %(start)s AND %(end)s
 		GROUP BY transaction_code
 		ORDER BY transaction_code
 		""",
-		{"property": property, "date": date}, as_dict=True,
+		{"property": property, "start": start, "end": end}, as_dict=True,
 	)
 	for r in rows:
 		r["description"] = frappe.db.get_value(
 			"Transaction Code", r.transaction_code, "description") or ""
-	return {"business_date": date, "rows": rows}
+	return {"business_date": date, "from_date": str(start), "to_date": str(end), "rows": rows}
 
 
 @frappe.whitelist()
@@ -269,6 +549,27 @@ def financial_activity(property: str, business_date: str | None = None,
 
 # ── City ledger (AR) ─────────────────────────────────────────────────────────
 
+def _lock_account(account: str) -> None:
+	"""Hold this City Ledger Account row to the end of the transaction, so
+	two posts on one account (payments, transfers, reversals) run one after
+	the other. Read the account after this with locking reads
+	(locked_account_figures): a plain read can still return the snapshot
+	from before the wait."""
+	frappe.db.get_value("City Ledger Account", account, "name", for_update=True)
+
+
+def _sync_account_balance(account: str) -> float:
+	"""Set the account's stored balance from its entries, under the lock.
+	Adding to the stored figure loses an update when two posts overlap; the
+	entries are the record."""
+	rows = frappe.db.sql(
+		"""SELECT debit, credit FROM `tabCity Ledger Entry`
+		   WHERE account = %s FOR UPDATE""", account, as_dict=True)
+	balance = round(sum(float(r.debit or 0) - float(r.credit or 0) for r in rows), 2)
+	frappe.db.set_value("City Ledger Account", account, "balance", balance)
+	return balance
+
+
 def _ar_account(property: str, company: str) -> str:
 	name = frappe.db.get_value(
 		"City Ledger Account",
@@ -289,25 +590,110 @@ def _ar_account(property: str, company: str) -> str:
 	return doc.name
 
 
-def transfer_to_city_ledger(folio: str, company: str | None = None) -> dict:
-	"""Move an unpaid folio balance to company AR at checkout."""
+def company_payer_of(folio) -> str | None:
+	"""The company that pays this folio on credit, or None when the guest
+	pays it. Only a Company folio (the stay's company) or a group master
+	(the group's company) is the company's bill; Guest and Extra folios -
+	liquor, extras - are always the guest's."""
+	kind = folio.get("folio_type") or "Guest"
+	company = None
+	if kind == "Company" and folio.get("reservation"):
+		company = frappe.db.get_value(
+			"Reservation", folio.get("reservation"), "company")
+	elif kind == "Group" and folio.get("group_booking"):
+		company = frappe.db.get_value(
+			"Group Booking", folio.get("group_booking"), "company")
+	if company and frappe.db.get_value(
+			"Corporate Account", company, "credit_allowed"):
+		return company
+	return None
+
+
+def effective_credit_days(account: str | None, property: str | None = None) -> int:
+	"""The payment terms of a city ledger account. With "use property
+	default" on (the default), the property's `default_credit_days`;
+	otherwise its own credit_days as entered - 0 is due on the invoice date."""
+	if account:
+		row = frappe.db.get_value(
+			"City Ledger Account", account,
+			["credit_days", "use_default_credit_days", "property"], as_dict=True) or {}
+		property = property or row.get("property")
+		if row and not int(row.get("use_default_credit_days") or 0):
+			return max(int(row.get("credit_days") or 0), 0)
+	from kamra.settings import get_setting
+	return max(int(get_setting(property, "default_credit_days") or 0), 0)
+
+
+def due_date_for(account: str | None, invoice_date, property: str | None = None) -> str:
+	"""Invoice date + the account's effective credit days."""
+	from frappe.utils import add_days
+	return str(add_days(invoice_date, effective_credit_days(account, property)))
+
+
+def _transfer_company(folio, company: str | None = None) -> str | None:
+	"""Who a city ledger transfer bills: the company asked for, else the
+	stay's, else the group's."""
+	if not company and folio.get("reservation"):
+		company = frappe.db.get_value("Reservation", folio.reservation, "company")
+	if not company and folio.get("group_booking"):
+		company = frappe.db.get_value(
+			"Group Booking", folio.group_booking, "company")
+	return company
+
+
+def transfer_to_city_ledger(folio: str, company: str | None = None,
+                            invoice_date: str | None = None,
+                            credit_check: bool = True,
+                            credit_override_reason: str | None = None,
+                            account: str | None = None) -> dict:
+	"""Move an unpaid folio balance to company AR at checkout.
+	`invoice_date` dates the AR invoice when it is older than today - an
+	unpaid bill carried over from the old system at go-live, so aging
+	counts from when the company was really billed. The bill is due
+	`invoice date + credit days` (the account's, else the property's).
+
+	`credit_check` runs the property's credit control (kamra.credit) first:
+	warn lets it through with a warning, block refuses unless Finance or a
+	Hotel Admin overrides with a reason. Go-live passes False - those bills
+	were already on credit in the old system - and checkout passes False
+	because it has checked every company of the stay at once.
+
+	`account` bills that exact City Ledger Account (it must be the
+	company's) instead of the company's first open one."""
+	# one transfer of a bill at a time: a second press waits here and then
+	# reads what the first left (a locking read, not the request's snapshot)
+	locked = float(frappe.db.get_value("Folio", folio, "balance", for_update=True) or 0)
 	doc = frappe.get_doc("Folio", folio)
 	balance = float(doc.balance or 0)
-	if balance <= 0:
+	if locked <= 0:
 		frappe.throw("No balance to transfer to city ledger.")
-	if not company and doc.get("reservation"):
-		company = frappe.db.get_value("Reservation", doc.reservation, "company")
-	if not company and doc.get("group_booking"):
-		company = frappe.db.get_value(
-			"Group Booking", doc.group_booking, "company")
+	if abs(locked - balance) > 0.005:
+		frappe.throw(frappe._("This bill changed while it was being moved to the "
+		                      "company's account. Try again."))
+	company = _transfer_company(doc, company)
 	if not company:
 		frappe.throw("A company is required for city ledger transfer.")
-	if not frappe.db.get_value("Company", company, "credit_allowed"):
+	if not frappe.db.get_value("Corporate Account", company, "credit_allowed"):
 		frappe.throw(f"{company} is not allowed on city ledger (credit).")
-	account = _ar_account(doc.property, company)
+	credit = None
+	if credit_check:
+		from kamra.credit import enforce_company_credit
+		credit = enforce_company_credit(
+			company, doc.property, balance,
+			override_reason=credit_override_reason,
+			context="city ledger transfer",
+			reference_doctype="Folio", reference_name=doc.name,
+			exclude_folios=[doc.name])
+	if account and frappe.db.get_value(
+			"City Ledger Account", account, ["property", "company"]) != (
+			doc.property, company):
+		frappe.throw(f"{account} is not {company}'s account at this property.")
+	account = account or _ar_account(doc.property, company)
+	_lock_account(account)
 	bd = get_business_date(doc.property)
+	inv_date = invoice_date or bd
 	# Zero the guest folio with a Company Credit payment
-	doc.append("payments", {
+	row = doc.append("payments", {
 		"posting_date": bd,
 		"payment_kind": "Payment",
 		"mode": "Company Credit",
@@ -318,6 +704,10 @@ def transfer_to_city_ledger(folio: str, company: str | None = None) -> dict:
 	_recalculate(doc)
 	doc.save(ignore_permissions=True)
 
+	# Two legs, like any transfer: the Company Credit payment credits the
+	# guest ledger (the folio is settled) and the same amount debits AR.
+	# Without the guest credit the debt sat in both ledgers at once.
+	record_payment_ledger(doc, row.as_dict())
 	write_ledger_entry(
 		property=doc.property,
 		folio=doc.name,
@@ -335,101 +725,992 @@ def transfer_to_city_ledger(folio: str, company: str | None = None) -> dict:
 		"doctype": "City Ledger Entry",
 		"account": account,
 		"property": doc.property,
-		"posting_date": bd,
+		"posting_date": inv_date,
 		"kind": "Invoice",
 		"folio": doc.name,
 		"invoice_number": doc.invoice_number,
+		"due_date": due_date_for(account, inv_date, doc.property),
 		"debit": balance,
 		"credit": 0,
 		"reference": doc.name,
 	}).insert(ignore_permissions=True)
-	acc = frappe.get_doc("City Ledger Account", account)
-	acc.balance = float(acc.balance or 0) + balance
-	acc.save(ignore_permissions=True)
-	return {"account": account, "amount": balance, "balance": acc.balance}
+	account_balance = _sync_account_balance(account)
+	from kamra.webhooks import emit_ar
+	emit_ar("ar.bill_created", doc.property, {
+		"account": account, "company": company, "folio": doc.name,
+		"folio_type": doc.get("folio_type"), "reservation": doc.get("reservation"),
+		"invoice_date": str(inv_date),
+		"due_date": str(due_date_for(account, inv_date, doc.property)),
+		"amount": round(balance, 2), "account_balance": round(float(account_balance), 2)})
+	# money the company already paid ahead (an unapplied credit) settles
+	# this new bill straight away
+	applied = apply_unapplied_credit(account, only_folio=doc.name)
+	out = {"account": account, "amount": balance, "balance": account_balance,
+	       "applied_from_credit": sum(r["amount"] for r in applied)}
+	if credit and not credit.get("ok"):
+		out["credit"] = credit
+	return out
+
+
+def reverse_city_ledger_transfer(folio: str, reason: str) -> float:
+	"""Undo transfer_to_city_ledger for a folio whose checkout is being
+	reinstated: the bill comes back to the stay and leaves the company's
+	account. Refused once the company has paid any of it. Returns the
+	amount brought back (0 when the folio was never billed on)."""
+	frappe.db.get_value("Folio", folio, "name", for_update=True)
+	doc = frappe.get_doc("Folio", folio)
+	out = [p for p in doc.payments if p.mode == "Company Credit"
+	       and (p.reference or "").startswith(("city-ledger:", "city-ledger-back:"))]
+	net = round(sum(float(p.amount or 0) for p in out), 2)
+	if net <= 0.009:
+		return 0
+	account = out[0].reference.split(":", 1)[1]
+	_lock_account(account)
+	# company payments are applied to the bill on its ledger (as in
+	# city_ledger_open_folios); a credit note lowers what is billed. Locking
+	# reads: a payment that landed while this waited must count.
+	paid = sum(float(r.credit or 0) - float(r.debit or 0) for r in frappe.db.sql(
+		"""SELECT credit, debit FROM `tabFolio Ledger Entry`
+		   WHERE folio = %s AND source_doctype = 'City Ledger Entry' FOR UPDATE""",
+		doc.name, as_dict=True))
+	billed = sum(float(r.debit or 0) - float(r.credit or 0) for r in frappe.db.sql(
+		"""SELECT debit, credit FROM `tabCity Ledger Entry`
+		   WHERE folio = %s AND account = %s AND kind != 'Payment' FOR UPDATE""",
+		(doc.name, account), as_dict=True))
+	if float(paid or 0) > 0.009:
+		frappe.throw(frappe._("The company has already paid part of this bill (or money it "
+		              "paid ahead was applied), so the checkout can't be undone. Finance "
+		              "can correct it on the account."))
+	if billed < net - 0.009:
+		frappe.throw(frappe._("A credit note or adjustment already changed this bill on the "
+		              "company's account, so the checkout can't be undone. Finance can "
+		              "correct it on the account."))
+	bd = get_business_date(doc.property)
+	row = doc.append("payments", {
+		"posting_date": bd, "payment_kind": "Payment", "mode": "Company Credit",
+		"amount": -net, "reference": f"city-ledger-back:{account}",
+	})
+	from kamra.folio import _recalculate
+	_recalculate(doc)
+	doc.save(ignore_permissions=True)
+	record_payment_ledger(doc, row.as_dict())
+	company = frappe.db.get_value("City Ledger Account", account, "company")
+	write_ledger_entry(
+		property=doc.property, folio=doc.name, ledger="AR", credit=net,
+		description=f"Back from city ledger {company}",
+		source_doctype="Folio", source_name=doc.name)
+	frappe.get_doc({
+		"doctype": "City Ledger Entry", "account": account,
+		"property": doc.property, "posting_date": bd, "kind": "Credit Note",
+		"folio": doc.name, "debit": 0, "credit": net, "reference": doc.name,
+		"notes": f"Checkout reinstated: {reason}",
+	}).insert(ignore_permissions=True)
+	_sync_account_balance(account)
+	return net
 
 
 @frappe.whitelist(methods=["POST"])
 @require_roles("Finance", "Front Desk", "Kamra Agent")
 def city_ledger_transfer(folio: str, company: str | None = None,
-                         pin: str | None = None):
+                         pin: str | None = None,
+                         credit_override_reason: str | None = None):
+	"""Move a folio's unpaid balance to the company's city ledger. Runs the
+	property's credit control: over the credit limit or with overdue bills
+	it warns, or refuses (CREDIT_BLOCKED) unless Finance or a Hotel Admin
+	passes `credit_override_reason`. Agents can't override."""
 	from kamra.authz import require_cashier_pin
-	prop = frappe.db.get_value("Folio", folio, "property")
-	require_cashier_pin(prop, pin)
-	return transfer_to_city_ledger(folio, company)
+	from kamra.receivables import assert_billable
+	doc = frappe.get_doc("Folio", folio)
+	require_cashier_pin(doc.property, pin)
+	# the stay's company too, not only one passed in: a restricted account
+	# takes no new bills either way
+	company = _transfer_company(doc, company)
+	if company:
+		assert_billable(frappe.db.get_value(
+			"City Ledger Account",
+			{"property": doc.property, "company": company, "disabled": 0}, "name"))
+	return transfer_to_city_ledger(
+		folio, company, credit_override_reason=credit_override_reason)
+
+
+# A company payment is one City Ledger Entry (kind Payment, no folio) that
+# reduces the account. What it pays is recorded on the books: one AR credit
+# per folio in Folio Ledger Entry, sourced to that City Ledger Entry. The
+# part not applied to any folio stays on the account as unapplied credit
+# (the AR ledger needs a folio, so it has no AR entry until it is applied).
+
+def _payment_code() -> str | None:
+	code = PAYMENT_CODES["Payment"][0]
+	if not frappe.db.exists("Transaction Code", code):
+		ensure_default_transaction_codes()
+	return code if frappe.db.exists("Transaction Code", code) else None
+
+
+def city_ledger_open_folios(account: str) -> list[dict]:
+	"""Every folio billed to this account, oldest bill first: what was
+	billed (transfers less credit notes), what company payments have
+	cleared, and what is still owed."""
+	billed = frappe.db.sql(
+		"""
+		SELECT folio,
+		       MIN(CASE WHEN kind = 'Invoice'
+		                 THEN COALESCE(invoice_date, posting_date) END) AS invoice_date,
+		       MIN(CASE WHEN kind = 'Invoice' THEN due_date END) AS due_date,
+		       MIN(posting_date) AS first_date,
+		       MAX(CASE WHEN kind = 'Invoice' THEN invoice_number END) AS invoice_number,
+		       MAX(disputed) AS disputed, MAX(dispute_note) AS dispute_note,
+		       COALESCE(SUM(debit - credit), 0) AS billed
+		FROM `tabCity Ledger Entry`
+		WHERE account = %s AND IFNULL(folio, '') != '' AND kind != 'Payment'
+		GROUP BY folio
+		""",
+		account, as_dict=True,
+	)
+	paid = dict(frappe.db.sql(
+		"""
+		SELECT e.folio, COALESCE(SUM(e.credit - e.debit), 0)
+		FROM `tabFolio Ledger Entry` e
+		JOIN `tabCity Ledger Entry` c ON c.name = e.source_name
+		WHERE e.source_doctype = 'City Ledger Entry' AND c.account = %s
+		GROUP BY e.folio
+		""",
+		account,
+	))
+	out = []
+	days = None
+	for r in billed:
+		p = float(paid.get(r.folio) or 0)
+		inv = str(r.invoice_date or r.first_date)
+		due = r.due_date
+		if not due:
+			# a bill raised before due dates were recorded: invoice date +
+			# the account's terms today (the backfill patch stores it)
+			if days is None:
+				days = effective_credit_days(account)
+			from frappe.utils import add_days
+			due = add_days(inv, days)
+		out.append({
+			"folio": r.folio,
+			"invoice_number": r.invoice_number,
+			"invoice_date": inv,
+			"due_date": str(due),
+			"billed": round(float(r.billed), 2),
+			"paid": round(p, 2),
+			"outstanding": round(float(r.billed) - p, 2),
+			"disputed": int(r.disputed or 0),
+			"dispute_note": r.dispute_note,
+		})
+	out.sort(key=lambda r: (r["invoice_date"], r["folio"]))
+	return out
+
+
+def locked_account_figures(account: str) -> dict:
+	"""Open bills and the account balance from a locking read.
+
+	The caller holds the City Ledger Account row. A plain SUM after that
+	wait can still be the snapshot from the start of the request, so two
+	transfers would each move the full amount. These reads are FOR UPDATE.
+	"""
+	entries = frappe.db.sql(
+		"""SELECT folio, kind, debit, credit, posting_date, invoice_date,
+		          due_date, invoice_number, disputed, dispute_note
+		   FROM `tabCity Ledger Entry`
+		   WHERE account = %s
+		   FOR UPDATE""",
+		account, as_dict=True)
+	applied = frappe.db.sql(
+		"""SELECT e.folio, e.credit, e.debit
+		   FROM `tabFolio Ledger Entry` e
+		   JOIN `tabCity Ledger Entry` c ON c.name = e.source_name
+		   WHERE e.source_doctype = 'City Ledger Entry' AND c.account = %s
+		   FOR UPDATE""",
+		account, as_dict=True)
+	ar = round(sum(float(e.debit or 0) - float(e.credit or 0) for e in entries), 2)
+	paid: dict[str, float] = {}
+	for row in applied:
+		if not row.folio:
+			continue
+		paid[row.folio] = paid.get(row.folio, 0.0) + float(row.credit or 0) - float(row.debit or 0)
+	groups: dict[str, dict] = {}
+	for e in entries:
+		if not e.folio or e.kind == "Payment":
+			continue
+		g = groups.setdefault(e.folio, {
+			"billed": 0.0, "invoice_date": None, "due": None,
+			"first": None, "number": None, "disputed": 0, "note": None,
+		})
+		g["billed"] += float(e.debit or 0) - float(e.credit or 0)
+		if e.disputed:
+			g["disputed"], g["note"] = 1, g["note"] or e.dispute_note
+		posted = str(e.posting_date)
+		if g["first"] is None or posted < g["first"]:
+			g["first"] = posted
+		if e.kind == "Invoice":
+			inv = str(e.invoice_date or e.posting_date)
+			if g["invoice_date"] is None or inv < g["invoice_date"]:
+				g["invoice_date"] = inv
+			if e.due_date and (g["due"] is None or str(e.due_date) < str(g["due"])):
+				g["due"] = str(e.due_date)
+			number = e.invoice_number or ""
+			if g["number"] is None or number > g["number"]:
+				g["number"] = number
+	days = None
+	out = []
+	for folio, g in groups.items():
+		inv = g["invoice_date"] or g["first"]
+		due = g["due"]
+		if not due:
+			if days is None:
+				days = effective_credit_days(account)
+			from frappe.utils import add_days
+			due = str(add_days(inv, days))
+		billed = round(g["billed"], 2)
+		settled = round(paid.get(folio) or 0, 2)
+		out.append({
+			"folio": folio,
+			"invoice_number": g["number"],
+			"invoice_date": inv,
+			"due_date": str(due),
+			"billed": billed,
+			"paid": settled,
+			"outstanding": round(billed - settled, 2),
+			"disputed": g["disputed"],
+			"dispute_note": g["note"],
+		})
+	out.sort(key=lambda r: (r["invoice_date"], r["folio"]))
+	outstanding = round(sum(max(r["outstanding"], 0) for r in out), 2)
+	unapplied = round(max(outstanding - ar, 0.0), 2)
+	return {"open_items": out, "unapplied_credit": unapplied, "ar_balance": ar}
+
+
+def _unapplied_payments(account: str) -> list[dict]:
+	"""Company payments on this account with money not yet applied to a
+	folio, oldest first. Locking reads: callers hold the account."""
+	rows = frappe.db.sql(
+		"""
+		SELECT name, posting_date, reference, credit - debit AS amount
+		FROM `tabCity Ledger Entry`
+		WHERE account = %(account)s AND kind = 'Payment' AND IFNULL(folio, '') = ''
+		  AND credit > 0
+		  AND name NOT IN (SELECT reverses FROM `tabCity Ledger Entry`
+		                   WHERE account = %(account)s AND IFNULL(reverses, '') != '')
+		ORDER BY posting_date ASC, creation ASC
+		FOR UPDATE
+		""",
+		{"account": account}, as_dict=True,
+	)
+	applied: dict[str, float] = {}
+	for e in frappe.db.sql(
+			"""SELECT e.source_name, e.credit, e.debit
+			   FROM `tabFolio Ledger Entry` e
+			   JOIN `tabCity Ledger Entry` c ON c.name = e.source_name
+			   WHERE e.source_doctype = 'City Ledger Entry' AND c.account = %s
+			   FOR UPDATE""", account, as_dict=True):
+		applied[e.source_name] = (applied.get(e.source_name, 0.0)
+		                          + float(e.credit or 0) - float(e.debit or 0))
+	out = []
+	for r in rows:
+		remaining = round(float(r.amount or 0) - applied.get(r.name, 0.0), 2)
+		if remaining > 0.005:
+			out.append({"name": r.name, "posting_date": str(r.posting_date),
+			            "reference": r.reference, "remaining": remaining})
+	return out
+
+
+def _post_ar_credit(acc, payment: str, folio: str, amount: float,
+                    reference: str | None = None,
+                    business_date: str | None = None) -> str:
+	return write_ledger_entry(
+		property=acc.property,
+		folio=folio,
+		ledger="AR",
+		credit=round(float(amount), 2),
+		description=f"City ledger payment {acc.company}"
+		            + (f" · {reference}" if reference else ""),
+		transaction_code=_payment_code(),
+		source_doctype="City Ledger Entry",
+		source_name=payment,
+		business_date=business_date,
+	)
+
+
+def _allocation_plan(account: str, amount: float, allocations=None) -> list[dict]:
+	"""[{folio, amount}] for a payment: oldest bill first by default, or
+	the caller's explicit folios (each within what that folio still owes,
+	all within the payment). Whatever is left stays unapplied. The caller
+	holds the account (_lock_account); the bills come from a locking read."""
+	open_items = {r["folio"]: r for r in locked_account_figures(account)["open_items"]
+	              if r["outstanding"] > 0.005}
+	if allocations in (None, "", []):
+		plan, left = [], round(float(amount), 2)
+		for r in open_items.values():
+			if left <= 0.005:
+				break
+			take = round(min(left, r["outstanding"]), 2)
+			plan.append({"folio": r["folio"], "amount": take})
+			left = round(left - take, 2)
+		return plan
+	if isinstance(allocations, str):
+		allocations = json.loads(allocations)
+	plan, seen, total = [], set(), 0.0
+	for a in allocations or []:
+		folio = (a or {}).get("folio")
+		amt = round(float((a or {}).get("amount") or 0), 2)
+		if not amt:
+			continue
+		if folio in seen:
+			frappe.throw(f"{folio} is listed twice.")
+		seen.add(folio)
+		item = open_items.get(folio)
+		if not item:
+			frappe.throw(f"{folio} has nothing open on this city ledger account.")
+		if amt < 0:
+			frappe.throw("Allocation amounts must be positive.")
+		if amt > item["outstanding"] + 0.005:
+			frappe.throw(f"{folio} owes {item['outstanding']:,.2f} - "
+			             f"can't apply {amt:,.2f} to it.")
+		total += amt
+		plan.append({"folio": folio, "amount": amt})
+	if total > float(amount) + 0.005:
+		frappe.throw(f"Allocations ({total:,.2f}) are more than the payment "
+		             f"({float(amount):,.2f}).")
+	return plan
+
+
+def apply_unapplied_credit(account: str, only_folio: str | None = None,
+                           backdate: bool = False) -> list[dict]:
+	"""Apply money the company paid but that is not yet on any folio -
+	oldest payment to oldest open bill. `only_folio` limits it to one bill
+	(a fresh transfer); `backdate` dates each AR credit to the later of the
+	payment and the bill (used by the backfill patch)."""
+	_lock_account(account)
+	acc = frappe.get_doc("City Ledger Account", account)
+	items = [r for r in locked_account_figures(account)["open_items"]
+	         if r["outstanding"] > 0.005
+	         and (not only_folio or r["folio"] == only_folio)]
+	applied = []
+	for p in _unapplied_payments(account):
+		left = p["remaining"]
+		for r in items:
+			if left <= 0.005:
+				break
+			if r["outstanding"] <= 0.005:
+				continue
+			take = round(min(left, r["outstanding"]), 2)
+			bd = max(p["posting_date"], r["invoice_date"]) if backdate else None
+			_post_ar_credit(acc, p["name"], r["folio"], take,
+			                reference=p["reference"], business_date=bd)
+			r["outstanding"] = round(r["outstanding"] - take, 2)
+			left = round(left - take, 2)
+			applied.append({"payment": p["name"], "folio": r["folio"],
+			                "amount": take})
+	return applied
 
 
 @frappe.whitelist(methods=["POST"])
 @require_roles("Finance", "Hotel Admin", "Kamra Agent")
 def city_ledger_settle(account: str, amount: float, mode: str = "Bank Transfer",
-                       reference: str | None = None):
-	if float(amount) <= 0:
+                       reference: str | None = None, allocations=None,
+                       idempotency_key: str | None = None,
+                       received_on: str | None = None, pin: str | None = None):
+	"""Record a company's payment against its city ledger account and clear
+	the AR it pays. By default it pays the oldest open bills first;
+	`allocations` ([{folio, amount}]) names the folios instead. Any excess
+	stays on the account as unapplied credit and settles the company's next
+	bill. `received_on` is the date the money arrived (the business date
+	when left out, never later).
+
+	An AI agent's payment is not posted: it waits as a Company Payment
+	Request ({"pending": True, ...}) until Finance confirms it with a PIN
+	(decide_city_ledger_payment). With the property's "PIN on company
+	payments" setting on, a desk payment asks for the user's PIN too.
+
+	Pass idempotency_key (one per "Record payment" press): a retry with the
+	same key returns the first result and posts nothing. Two payments on
+	one account at once run one after the other, so they never both clear
+	the same bill."""
+	from kamra.credit import _is_agent
+	amount = round(float(amount or 0), 2)
+	if amount <= 0:
 		frappe.throw("Amount must be positive.")
+	key = (idempotency_key or "").strip()[:140] or None
+	_lock_account(account)
+	if key:
+		first = _settled_with_key(key) or _requested_with_key(key)
+		if first:
+			if first["account"] != account:
+				frappe.throw(frappe._("This payment was already recorded on {0}.").format(
+					first["account"]))
+			return first
 	acc = frappe.get_doc("City Ledger Account", account)
+	if acc.disabled:
+		frappe.throw("This city ledger account is disabled.")
+	received = _received_on(acc.property, received_on)
+	plan = _allocation_plan(account, amount, allocations)
+	if _is_agent():
+		return _request_company_payment(acc, amount, mode, reference, plan, key, received)
+	from kamra.settings import get_setting
+	if int(get_setting(acc.property, "city_ledger_payment_pin") or 0):
+		from kamra.authz import verify_supervisor
+		verify_supervisor(acc.property, frappe.session.user, pin)
+	return _post_company_payment(acc, amount, mode, reference, plan, key, received)
+
+
+def _received_on(property: str, value) -> str:
+	"""The date a company payment arrived: the business date by default,
+	an earlier date when the bank credited it before it was entered."""
+	from frappe.utils import getdate
+	bd = get_business_date(property)
+	if not value:
+		return bd
+	if getdate(value) > getdate(bd):
+		frappe.throw(frappe._("The received date can't be after the business date ({0}).").format(bd))
+	return str(getdate(value))
+
+
+def _post_company_payment(acc, amount: float, mode: str, reference: str | None,
+                          plan: list[dict], key: str | None, received: str,
+                          note: str | None = None) -> dict:
+	"""Post a company payment the caller has planned under the account
+	lock: one City Ledger Entry and an AR credit per folio it clears."""
 	bd = get_business_date(acc.property)
-	frappe.get_doc({
+	ref = (reference or "").strip() or mode
+	payment = frappe.get_doc({
 		"doctype": "City Ledger Entry",
-		"account": account,
+		"account": acc.name,
 		"property": acc.property,
 		"posting_date": bd,
+		"received_on": received,
 		"kind": "Payment",
 		"debit": 0,
-		"credit": float(amount),
-		"reference": reference or mode,
+		"credit": amount,
+		"reference": ref[:140],
+		"notes": f"{mode}" + (f" · {reference}" if reference else ""),
+		"idempotency_key": key,
 	}).insert(ignore_permissions=True)
-	acc.balance = float(acc.balance or 0) - float(amount)
-	acc.save(ignore_permissions=True)
-	return {"account": account, "balance": acc.balance}
+	for a in plan:
+		_post_ar_credit(acc, payment.name, a["folio"], a["amount"], reference=ref)
+	balance = _sync_account_balance(acc.name)
+	applied_total = round(sum(a["amount"] for a in plan), 2)
+	from kamra.webhooks import emit_ar
+	emit_ar("ar.payment_recorded", acc.property, {
+		"account": acc.name, "company": acc.company, "payment": payment.name,
+		"posting_date": str(bd), "mode": mode, "reference": reference or None,
+		"amount": amount,
+		"applied": [{"folio": a["folio"], "amount": round(float(a["amount"]), 2)}
+		            for a in plan],
+		"unapplied": round(amount - applied_total, 2),
+		"account_balance": round(float(acc.balance), 2)})
+	from kamra.savings import log_action
+	log_action("city_ledger_settle", "City Ledger Account", acc.name,
+	           acc.property,
+	           rationale=f"{acc.company} paid {amount:,.2f} by {mode}"
+	                     + (f" on {received}" if received != bd else "")
+	                     + f"; applied {applied_total:,.2f} to {len(plan)} folio(s)"
+	                     + (f"; {note}" if note else ""))
+	return {
+		"account": acc.name,
+		"payment": payment.name,
+		"balance": balance,
+		"applied": plan,
+		"unapplied": round(amount - applied_total, 2),
+	}
+
+
+def _request_company_payment(acc, amount: float, mode: str, reference: str | None,
+                             plan: list[dict], key: str | None, received: str) -> dict:
+	"""An agent's company payment: kept as a request, with the bills it
+	would clear frozen, until Finance confirms it. Nothing touches the
+	account or the books."""
+	from kamra.api import agent_channel
+	from kamra.savings import log_action
+	req = frappe.get_doc({
+		"doctype": "Company Payment Request",
+		"property": acc.property, "account": acc.name, "company": acc.company,
+		"amount": amount, "mode": mode, "reference": (reference or "").strip()[:140] or None,
+		"received_on": received, "allocations": json.dumps(plan),
+		"idempotency_key": key, "status": "Pending",
+		"requested_by": frappe.session.user, "requested_on": now_datetime(),
+		"channel": agent_channel() or "API",
+	}).insert(ignore_permissions=True)
+	log_action("city_ledger_payment_requested", "City Ledger Account", acc.name,
+	           acc.property, approval_status="Pending",
+	           rationale=f"{acc.company} paid {amount:,.2f} by {mode} (as reported, "
+	                     f"{req.name}); waits for Finance to confirm")
+	return _request_result(req)
+
+
+def _request_result(req) -> dict:
+	plan = json.loads(req.allocations or "[]")
+	return {
+		"pending": req.status == "Pending",
+		"status": req.status,
+		"request": req.name,
+		"account": req.account,
+		"amount": float(req.amount),
+		"applied": plan,
+		"unapplied": round(float(req.amount) - sum(a["amount"] for a in plan), 2),
+		"payment": req.payment,
+		"message": frappe._("Recorded for Finance to confirm. It does not change the "
+		                    "account until a Finance user confirms it with their PIN.")
+		           if req.status == "Pending" else None,
+	}
+
+
+def _requested_with_key(key: str) -> dict | None:
+	name = frappe.db.get_value("Company Payment Request",
+	                           {"idempotency_key": key}, "name")
+	if not name:
+		return None
+	out = _request_result(frappe.get_doc("Company Payment Request", name))
+	out["idempotent_replay"] = True
+	return out
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Finance", "Hotel Admin")
+def decide_city_ledger_payment(request: str, approve: int = 1, note: str = "",
+                               pin: str | None = None):
+	"""Confirm or reject a company payment an agent recorded. Confirming
+	needs the Finance user's own PIN every time and posts exactly what was
+	proposed: the amount, mode, reference, received date and the bills it
+	clears. If one of those bills was paid since, it is refused; reject it
+	and record the payment again. A rejection needs a note. AI agents never
+	decide."""
+	from frappe.utils import cint
+
+	from kamra.authz import assert_property_access, verify_supervisor
+	from kamra.credit import _is_agent
+	from kamra.savings import log_action
+	if _is_agent():
+		frappe.throw(frappe._("An AI agent can't confirm a company payment. Ask Finance."),
+		             frappe.PermissionError)
+	req = frappe.get_doc("Company Payment Request", request, for_update=True)
+	assert_property_access(req.property)
+	if req.status != "Pending":
+		frappe.throw(frappe._("This payment was already {0}.").format(
+			frappe._(req.status).lower()))
+	me = frappe.session.user
+	note = (note or "").strip()
+	if cint(approve):
+		if me == req.requested_by:
+			frappe.throw(frappe._("You recorded this payment; another Finance user confirms it."),
+			             frappe.PermissionError)
+		verify_supervisor(req.property, me, pin)
+		_lock_account(req.account)
+		acc = frappe.get_doc("City Ledger Account", req.account)
+		proposed = json.loads(req.allocations or "[]")
+		# the same bills and amounts, checked against what they owe now
+		plan = _allocation_plan(req.account, float(req.amount), proposed) if proposed else []
+		out = _post_company_payment(
+			acc, float(req.amount), req.mode or "Bank Transfer", req.reference, plan,
+			req.idempotency_key, str(req.received_on or get_business_date(req.property)),
+			note=f"confirmed {req.name} by {me}")
+		req.update({"status": "Confirmed", "payment": out["payment"]})
+	else:
+		if not note:
+			frappe.throw(frappe._("Say why the payment is rejected - it goes on the record."))
+		req.status = "Rejected"
+		out = {"account": req.account}
+		log_action("city_ledger_payment_rejected", "City Ledger Account", req.account,
+		           req.property, approver=me, approval_status="Rejected",
+		           rationale=f"Rejected {req.name} ({float(req.amount):,.2f}): {note}")
+	req.update({"decided_by": me, "decided_on": now_datetime(), "decision_note": note or None})
+	req.flags.kamra_decision = True
+	req.save(ignore_permissions=True)
+	return {**out, "request": req.name, "status": req.status}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Finance", "Hotel Admin")
+def reverse_city_ledger_payment(payment: str, reason: str | None = None,
+                                reason_code: str | None = None, pin: str | None = None):
+	"""Undo a company payment: a bounced cheque, or money put on the wrong
+	account. Posts the opposite AR leg for every bill the payment cleared
+	(those bills are owed again, with their old due dates), takes back any
+	credit it left unapplied, and logs the reason. A payment is reversed
+	once; AI agents can't reverse."""
+	from kamra.authz import assert_property_access, require_cashier_pin
+	from kamra.credit import _is_agent
+	from kamra.savings import log_action
+	if _is_agent():
+		frappe.throw(frappe._("An AI agent can't reverse a company payment. Ask Finance."),
+		             frappe.PermissionError)
+	row = frappe.db.get_value(
+		"City Ledger Entry", payment,
+		["account", "property", "kind", "folio", "credit", "debit", "reverses", "reference"],
+		as_dict=True)
+	if not row or row.kind != "Payment" or row.folio or row.reverses \
+			or float(row.credit or 0) <= 0:
+		frappe.throw(frappe._("{0} is not a company payment.").format(payment))
+	assert_property_access(row.property)
+	require_cashier_pin(row.property, pin)
+	why = require_reason("Payment Reversal", reason_code, reason or "", property=row.property)
+	if reason_code and (reason or "").strip():
+		why = f"{reason_code}: {reason.strip()}"
+	_lock_account(row.account)
+	if frappe.db.sql("""SELECT name FROM `tabCity Ledger Entry`
+	                    WHERE reverses = %s FOR UPDATE""", payment):
+		frappe.throw(frappe._("This payment was already reversed."))
+	acc = frappe.get_doc("City Ledger Account", row.account)
+	per_folio: dict[str, float] = {}
+	for e in frappe.db.sql(
+			"""SELECT folio, credit, debit FROM `tabFolio Ledger Entry`
+			   WHERE source_doctype = 'City Ledger Entry' AND source_name = %s
+			   ORDER BY creation ASC FOR UPDATE""", payment, as_dict=True):
+		per_folio[e.folio] = per_folio.get(e.folio, 0.0) + float(e.credit or 0) - float(e.debit or 0)
+	amount = round(float(row.credit or 0) - float(row.debit or 0), 2)
+	rev = frappe.get_doc({
+		"doctype": "City Ledger Entry",
+		"account": acc.name, "property": acc.property,
+		"posting_date": get_business_date(acc.property),
+		"kind": "Payment", "debit": amount, "credit": 0,
+		"reference": f"Reversal {row.reference or payment}"[:140],
+		"notes": f"Reversed {payment}: {why}", "reverses": payment,
+	}).insert(ignore_permissions=True)
+	reopened = []
+	for folio, amt in per_folio.items():
+		amt = round(amt, 2)
+		if amt <= 0.005:
+			continue
+		write_ledger_entry(
+			property=acc.property, folio=folio, ledger="AR", debit=amt,
+			description=f"City ledger payment reversed {acc.company} · {why}",
+			transaction_code=_payment_code(),
+			source_doctype="City Ledger Entry", source_name=rev.name)
+		reopened.append({"folio": folio, "amount": amt})
+	balance = _sync_account_balance(acc.name)
+	log_action("city_ledger_payment_reversed", "City Ledger Account", acc.name,
+	           acc.property,
+	           rationale=f"Reversed {acc.company}'s payment {payment} of {amount:,.2f}: {why}")
+	return {"account": acc.name, "payment": payment, "reversal": rev.name,
+	        "amount": amount, "reopened": reopened, "balance": balance,
+	        "unapplied_removed": round(amount - sum(r["amount"] for r in reopened), 2)}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Finance", "Hotel Admin")
+def set_city_ledger_dispute(account: str, folio: str, disputed: int = 1,
+                            note: str | None = None):
+	"""Mark a company bill as disputed (or clear it). A disputed bill gets no
+	payment reminders and does not count towards the overdue credit block;
+	it stays on the account, in aging and on statements, flagged."""
+	from frappe.utils import cint
+
+	from kamra.authz import assert_property_access
+	from kamra.credit import _is_agent
+	from kamra.savings import log_action
+	if _is_agent():
+		frappe.throw(frappe._("An AI agent can't put a bill in dispute. Ask Finance."),
+		             frappe.PermissionError)
+	acc = frappe.get_doc("City Ledger Account", account)
+	assert_property_access(acc.property)
+	note = (note or "").strip()
+	flag = 1 if cint(disputed) else 0
+	if flag and not note:
+		frappe.throw(frappe._("Say what the company disputes - it shows on the bill."))
+	names = frappe.get_all("City Ledger Entry", pluck="name", filters={
+		"account": account, "folio": folio, "kind": ("!=", "Payment")})
+	if not names:
+		frappe.throw(frappe._("{0} is not billed on this account.").format(folio))
+	for name in names:
+		frappe.db.set_value("City Ledger Entry", name,
+		                    {"disputed": flag, "dispute_note": note[:500] if flag else None})
+	log_action("city_ledger_dispute" if flag else "city_ledger_dispute_cleared",
+	           "Folio", folio, acc.property,
+	           rationale=f"{acc.company}: " + (note or "dispute cleared"))
+	return {"account": account, "folio": folio, "disputed": flag}
+
+
+
+
+def _settled_with_key(key: str) -> dict | None:
+	"""What city_ledger_settle returned the first time for this key, rebuilt
+	from the books, or None when no payment carries it."""
+	row = frappe.db.sql(
+		"""SELECT name, account, credit - debit AS amount FROM `tabCity Ledger Entry`
+		   WHERE idempotency_key = %s AND kind = 'Payment' LIMIT 1 FOR UPDATE""",
+		key, as_dict=True)
+	if not row:
+		return None
+	row = row[0]
+	per_folio: dict[str, float] = {}
+	for e in frappe.db.sql(
+			"""SELECT folio, credit, debit FROM `tabFolio Ledger Entry`
+			   WHERE source_doctype = 'City Ledger Entry' AND source_name = %s
+			   ORDER BY creation ASC""", row.name, as_dict=True):
+		per_folio[e.folio] = round(per_folio.get(e.folio, 0.0)
+		                           + float(e.credit or 0) - float(e.debit or 0), 2)
+	applied = [{"folio": f, "amount": a} for f, a in per_folio.items()]
+	return {
+		"account": row.account,
+		"payment": row.name,
+		"balance": float(frappe.db.get_value("City Ledger Account", row.account, "balance",
+		                                        for_update=True) or 0),
+		"applied": applied,
+		"unapplied": round(float(row.amount or 0) - sum(a["amount"] for a in applied), 2),
+		"duplicate": True,
+		"idempotent_replay": True,
+	}
+
+
+# Aging is by DUE date: a bill is "not due" until invoice date + the
+# company's credit days, then 1-30 / 31-60 / 61-90 / 90+ days overdue.
+# The older invoice-age keys (current / b30 / b60 / b90 / b90p, 30-day steps
+# from the invoice date) are still returned for callers that read them.
+DUE_BUCKETS = ("not_due", "d1_30", "d31_60", "d61_90", "d90p")
+INVOICE_AGE_BUCKETS = ("current", "b30", "b60", "b90", "b90p")
+
+
+def _netted(open_items: list[dict], unapplied: float) -> list[tuple[dict, float]]:
+	"""(bill, what it still counts for) oldest first, with money the company
+	paid ahead (unapplied credit) netted off the oldest bills - so the
+	buckets add up to the account balance."""
+	credit = max(float(unapplied), 0.0)
+	out = []
+	for r in open_items:
+		amt = float(r["outstanding"])
+		if amt <= 0:
+			continue
+		if credit > 0:
+			take = min(credit, amt)
+			amt -= take
+			credit -= take
+		if amt <= 0.005:
+			continue
+		out.append((r, amt))
+	return out
+
+
+def aging_date(property: str | None) -> str:
+	"""The day aging, reminders and the overdue check count from: the
+	property's business date, so they agree with night audit around
+	midnight."""
+	return get_business_date(property)
+
+
+def days_overdue(item: dict, today=None) -> int:
+	from frappe.utils import date_diff, getdate
+	return date_diff(getdate(today or nowdate()), item["due_date"])
+
+
+def _due_bucket(overdue: int) -> str:
+	return ("not_due" if overdue <= 0 else "d1_30" if overdue <= 30 else
+	        "d31_60" if overdue <= 60 else "d61_90" if overdue <= 90 else "d90p")
+
+
+def _age_buckets(open_items: list[dict], unapplied: float, today=None) -> dict:
+	"""Aging as of `today`: pass the property's business date, so it
+	agrees with night audit around midnight. Disputed bills stay in their
+	bucket and are also summed under `disputed`."""
+	from frappe.utils import date_diff, getdate
+	buckets = dict.fromkeys(DUE_BUCKETS + INVOICE_AGE_BUCKETS, 0.0)
+	today = getdate(today or nowdate())
+	oldest_due = None
+	disputed = 0.0
+	for r, amt in _netted(open_items, unapplied):
+		if r.get("disputed"):
+			disputed += amt
+		late = days_overdue(r, today)
+		buckets[_due_bucket(late)] += amt
+		if late > 0 and (oldest_due is None or r["due_date"] < oldest_due):
+			oldest_due = r["due_date"]
+		age = date_diff(today, r["invoice_date"])
+		key = ("current" if age <= 30 else "b30" if age <= 60 else
+		       "b60" if age <= 90 else "b90" if age <= 120 else "b90p")
+		buckets[key] += amt
+	out = {k: round(v, 2) for k, v in buckets.items()}
+	out["overdue"] = round(sum(out[k] for k in DUE_BUCKETS[1:]), 2)
+	out["oldest_overdue_due_date"] = oldest_due
+	out["disputed"] = round(disputed, 2)
+	return out
+
+
+def overdue_past_grace(open_items: list[dict], unapplied: float,
+                       grace_days: int = 0, today=None) -> tuple[float, str | None]:
+	"""What the company owes on bills more than `grace_days` past their due
+	date (as of `today`, the business date), and the oldest such due date.
+	A disputed bill doesn't count."""
+	total, oldest = 0.0, None
+	today = today or nowdate()
+	for r, amt in _netted(open_items, unapplied):
+		if r.get("disputed"):
+			continue
+		if days_overdue(r, today) > int(grace_days or 0):
+			total += amt
+			if oldest is None or r["due_date"] < oldest:
+				oldest = r["due_date"]
+	return round(total, 2), oldest
+
+
+def _account_position(account: str) -> dict:
+	open_items = city_ledger_open_folios(account)
+	property = frappe.db.get_value("City Ledger Account", account, "property")
+	row = frappe.db.sql(
+		"""SELECT COALESCE(SUM(debit), 0) AS total_debit,
+		          COALESCE(SUM(credit), 0) AS total_credit,
+		          COALESCE(SUM(debit - credit), 0) AS balance
+		   FROM `tabCity Ledger Entry` WHERE account = %s""",
+		account, as_dict=True)[0]
+	balance = float(row.balance or 0)
+	outstanding = round(sum(max(r["outstanding"], 0) for r in open_items), 2)
+	unapplied = round(max(outstanding - balance, 0.0), 2)
+	return {
+		"open_items": open_items,
+		"open_balance": outstanding,
+		"unapplied_credit": unapplied,
+		"total_debit": round(float(row.total_debit or 0), 2),
+		"total_credit": round(float(row.total_credit or 0), 2),
+		"credit_days": effective_credit_days(account),
+		**_age_buckets(open_items, unapplied, aging_date(property)),
+	}
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Hotel Admin", "Front Desk", "Kamra Agent")
+@require_roles("Finance", "Hotel Admin", "Front Desk", "Night Auditor", "Kamra Agent")
 def city_ledger_aging(property: str):
+	"""Every company's AR at the property, aged by due date (not_due,
+	d1_30, d31_60, d61_90, d90p and their sum `overdue`). The invoice-age
+	keys (current, b30, b60, b90, b90p) are kept for older callers."""
 	accounts = frappe.get_all(
 		"City Ledger Account",
 		filters={"property": property, "disabled": 0},
 		fields=["name", "company", "account_number", "balance", "credit_limit"],
 	)
-	# Simple aging: open debit entries by age buckets
 	out = []
 	for a in accounts:
-		entries = frappe.get_all(
-			"City Ledger Entry",
-			filters={"account": a.name, "kind": "Invoice"},
-			fields=["posting_date", "debit", "credit", "folio", "invoice_number"],
-			order_by="posting_date asc",
-		)
-		# payments reduce oldest first (FIFO) for display only
-		paid = frappe.db.sql(
-			"""SELECT COALESCE(SUM(credit - debit), 0) FROM `tabCity Ledger Entry`
-			   WHERE account=%s AND kind='Payment'""",
-			a.name,
-		)[0][0] or 0
-		remaining_pay = float(paid)
-		buckets = {"current": 0.0, "b30": 0.0, "b60": 0.0, "b90": 0.0, "b90p": 0.0}
-		from frappe.utils import date_diff, getdate
-		today = getdate(nowdate())
-		for e in entries:
-			amt = float(e.debit or 0) - float(e.credit or 0)
-			if remaining_pay > 0:
-				take = min(remaining_pay, amt)
-				amt -= take
-				remaining_pay -= take
-			if amt <= 0:
-				continue
-			age = date_diff(today, e.posting_date)
-			if age <= 30:
-				buckets["current"] += amt
-			elif age <= 60:
-				buckets["b30"] += amt
-			elif age <= 90:
-				buckets["b60"] += amt
-			elif age <= 120:
-				buckets["b90"] += amt
-			else:
-				buckets["b90p"] += amt
-		out.append({**a, **buckets})
-	return {"accounts": out}
+		pos = _account_position(a.name)
+		pos.pop("open_items")
+		out.append({**a, **pos})
+	totals = {k: round(sum(a[k] for a in out), 2)
+	          for k in (*DUE_BUCKETS, "overdue", "disputed")}
+	return {"accounts": out, "totals": totals}
+
+
+def payment_bills(account: str, payments: list[str]) -> dict[str, list]:
+	"""{payment: [{folio, invoice_number, guest_name, amount}]}: the bills each
+	company payment cleared (the AR credits it posted per folio), so a bill
+	paid in full and gone from the open list is still traceable."""
+	out: dict[str, list] = {}
+	if not payments:
+		return out
+	for r in frappe.db.sql(
+			"""SELECT e.source_name AS payment, e.folio, f.guest_name,
+			          SUM(e.credit - e.debit) AS amount,
+			          (SELECT MAX(c.invoice_number) FROM `tabCity Ledger Entry` c
+			           WHERE c.account = %(a)s AND c.folio = e.folio
+			             AND c.kind = 'Invoice') AS invoice_number
+			   FROM `tabFolio Ledger Entry` e
+			   LEFT JOIN `tabFolio` f ON f.name = e.folio
+			   WHERE e.source_doctype = 'City Ledger Entry'
+			     AND e.source_name IN %(p)s
+			   GROUP BY e.source_name, e.folio, f.guest_name
+			   HAVING ABS(SUM(e.credit - e.debit)) > 0.005
+			   ORDER BY MIN(e.creation)""",
+			{"a": account, "p": tuple(payments)}, as_dict=True):
+		out.setdefault(r.payment, []).append({
+			"folio": r.folio, "invoice_number": r.invoice_number,
+			"guest_name": r.guest_name, "amount": round(float(r.amount), 2)})
+	return out
+
+
+@frappe.whitelist()
+@require_roles("Finance", "Hotel Admin", "Front Desk", "Kamra Agent")
+def city_ledger_history(account: str):
+	"""Everything that ever moved on one company's account, oldest first, with
+	the running balance: each bill (and the guest it was for), credit note,
+	adjustment and payment (with the bills it cleared)."""
+	from kamra.authz import assert_property_access
+	assert_property_access(frappe.db.get_value("City Ledger Account", account, "property"))
+	rows = frappe.db.sql(
+		"""SELECT c.name, c.posting_date, c.kind, c.folio, c.invoice_number,
+		          c.due_date, c.debit, c.credit, c.reference, c.notes,
+		          f.guest_name, f.reservation
+		   FROM `tabCity Ledger Entry` c LEFT JOIN `tabFolio` f ON f.name = c.folio
+		   WHERE c.account = %s ORDER BY c.posting_date, c.creation""",
+		account, as_dict=True)
+	bills = payment_bills(account, [r.name for r in rows if r.kind == "Payment"])
+	balance, out = 0.0, []
+	for r in rows:
+		balance = round(balance + float(r.debit or 0) - float(r.credit or 0), 2)
+		out.append({**r, "posting_date": str(r.posting_date),
+		            "debit": float(r.debit or 0), "credit": float(r.credit or 0),
+		            "balance": balance, "applied": bills.get(r.name, [])})
+	return {"account": account, "entries": out, "balance": balance}
+
+
+@frappe.whitelist()
+@require_roles("Finance", "Hotel Admin", "Front Desk", "Kamra Agent")
+def city_ledger_account(account: str):
+	"""One company's city ledger: balance, aging, each open bill (oldest
+	first) and recent payments - what the payment screen needs."""
+	from kamra.settings import get_setting
+	acc = frappe.get_doc("City Ledger Account", account)
+	pos = _account_position(account)
+	# every bill on the account, paid ones too, so the account page is the
+	# one list of a company's invoices; the open ones drive the statement
+	bills = pos.pop("open_items")
+	for r in bills:
+		f = frappe.db.get_value("Folio", r["folio"],
+		                        ["guest_name", "reservation", "folio_type"],
+		                        as_dict=True) or {}
+		r.update({"guest_name": f.get("guest_name"),
+		          "reservation": f.get("reservation"),
+		          "folio_type": f.get("folio_type")})
+	payments = frappe.get_all(
+		"City Ledger Entry",
+		filters={"account": account, "kind": "Payment"},
+		fields=["name", "posting_date", "received_on", "credit", "debit",
+		        "reference", "notes", "reverses"],
+		order_by="posting_date desc, creation desc",
+		limit_page_length=10,
+	)
+	paid_bills = payment_bills(account, [p.name for p in payments])
+	reversed_ = set(frappe.get_all(
+		"City Ledger Entry", pluck="reverses",
+		filters={"account": account, "reverses": ("is", "set")}))
+	for p in payments:
+		p["applied"] = paid_bills.get(p.name, [])
+		p["unapplied"] = round(float(p.credit) - sum(a["amount"] for a in p["applied"]), 2)
+		p["reversed"] = p.name in reversed_
+	pending = frappe.get_all(
+		"Company Payment Request",
+		filters={"account": account, "status": "Pending"},
+		fields=["name", "amount", "mode", "reference", "received_on",
+		        "allocations", "requested_by", "requested_on", "channel"],
+		order_by="requested_on asc")
+	today = aging_date(acc.property)
+	for r in bills:
+		r["days_overdue"] = max(days_overdue(r, today), 0) if r["outstanding"] > 0.005 else 0
+	open_items = [r for r in bills if r["outstanding"] > 0.005]
+	# rolling credit: what is owed and what in-house stays will owe use the
+	# limit up, payments free it again (kamra.credit counts the same way)
+	from kamra.credit import in_house_exposure
+	in_house = in_house_exposure(acc.company, acc.property)
+	limit = float(acc.credit_limit or 0)
+	return {
+		"in_house": in_house,
+		"available_credit": round(limit - float(acc.balance or 0) - in_house, 2)
+		                    if limit > 0 else None,
+		"account": acc.name,
+		"company": acc.company,
+		"account_number": acc.account_number,
+		"credit_limit": acc.credit_limit,
+		"account_credit_days": int(acc.get("credit_days") or 0),
+		"use_default_credit_days": bool(acc.get("use_default_credit_days")),
+		"billing_address": acc.get("billing_address"),
+		"restricted": bool(acc.get("restricted")),
+		"restricted_reason": acc.get("restricted_reason"),
+		"balance": float(acc.balance or 0),
+		**pos,
+		"open_items": open_items,
+		"bills": bills,
+		"payments": payments,
+		"pending_payments": pending,
+		"payment_pin_required": bool(int(get_setting(acc.property, "city_ledger_payment_pin") or 0)),
+		"cashier_pin_required": bool(frappe.db.get_value(
+			"Property", acc.property, "require_cashier_pin")),
+	}
 
 
 # ── Advance / Force bill ─────────────────────────────────────────────────────
@@ -442,10 +1723,10 @@ def force_advance_bill(reservation: str, nights: str = "entire",
 
 	nights: 'tonight' | 'entire' | integer string of nights.
 	"""
-	from kamra.folio import (open_folio, post_room_night, _nightly_room_rate,
-	                         _recalculate)
+	from frappe.utils import add_days, date_diff, getdate
+
 	from kamra.authz import require_cashier_pin
-	from frappe.utils import add_days, getdate, date_diff
+	from kamra.folio import _recalculate, open_folio, post_room_night
 
 	res = frappe.get_doc("Reservation", reservation)
 	require_cashier_pin(res.property, pin)
@@ -471,9 +1752,11 @@ def force_advance_bill(reservation: str, nights: str = "entire",
 		if getdate(day) >= co:
 			break
 		# Skip if already auto-posted for this date
+		from kamra.folio import voided_rows
+		voided = voided_rows(folio)
 		exists = any(
 			c.charge_type == "Room" and str(c.posting_date) == str(day)
-			and c.auto_posted
+			and c.auto_posted and not c.get("reversal_of") and c.name not in voided
 			for c in folio.charges
 		)
 		if exists:
@@ -564,15 +1847,20 @@ def issue_credit_note(folio: str, amount: float, reason: str,
 		})
 		from kamra.folio import _recalculate
 		_recalculate(doc)
-		doc.save(ignore_permissions=True)
+		# the allowance line carries the Guest-ledger credit itself
+		save_folio(doc)
 	else:
-		# Post AR credit if company linked on the reservation
-		company = None
-		if doc.get("reservation"):
+		# AR credit on the account the bill was last invoiced to (an Account
+		# folio has no stay; a transferred bill lives on the new account),
+		# else the stay's company
+		account = frappe.db.get_value(
+			"City Ledger Entry", {"folio": folio, "kind": "Invoice"}, "account",
+			order_by="creation desc")
+		if not account and doc.get("reservation"):
 			company = frappe.db.get_value(
 				"Reservation", doc.reservation, "company")
-		if company:
-			account = _ar_account(doc.property, company)
+			account = _ar_account(doc.property, company) if company else None
+		if account:
 			frappe.get_doc({
 				"doctype": "City Ledger Entry",
 				"account": account,
@@ -589,15 +1877,15 @@ def issue_credit_note(folio: str, amount: float, reason: str,
 			acc = frappe.get_doc("City Ledger Account", account)
 			acc.balance = float(acc.balance or 0) - float(amount)
 			acc.save(ignore_permissions=True)
-	write_ledger_entry(
-		property=doc.property,
-		folio=folio,
-		ledger="Guest" if doc.status == "Open" else "AR",
-		credit=float(amount),
-		description=f"Credit note {cn_number}",
-		source_doctype="Credit Note",
-		source_name=cn.name,
-	)
+		write_ledger_entry(
+			property=doc.property,
+			folio=folio,
+			ledger="AR",
+			credit=float(amount),
+			description=f"Credit note {cn_number}",
+			source_doctype="Credit Note",
+			source_name=cn.name,
+		)
 	return {"credit_note": cn.name, "number": cn_number}
 
 
@@ -626,12 +1914,20 @@ def record_folio_reprint(folio: str, document: str = "Guest Folio",
 
 
 @frappe.whitelist()
-@require_roles("Front Desk", "Finance", "Hotel Admin", "Kamra Agent")
+@require_roles("Front Desk", "Finance", "Hotel Admin", "Night Auditor", "Kamra Agent")
 def folio_history(property: str, query: str | None = None,
-                  status: str | None = None):
-	filters: list = [["property", "=", property]]
+                  status: str | None = None, from_date: str | None = None,
+                  to_date: str | None = None):
+	# account invoices have no stay to show - they live on Receivables
+	filters: list = [["property", "=", property],
+	                 ["folio_type", "!=", "Account"]]
 	if status:
 		filters.append(["status", "=", status])
+	if from_date:  # by the day the bill was closed
+		from kamra.business_date import report_range_end
+
+		to = report_range_end(from_date, to_date)
+		filters.append(["closed_on", "between", [from_date, f"{to} 23:59:59"]])
 	rows = frappe.get_all(
 		"Folio",
 		filters=filters,
@@ -663,6 +1959,8 @@ def batch_post_charge(folios: str | list, charge_type: str, amount: float,
 		folios = _json.loads(folios)
 	if not folios:
 		frappe.throw("Pick at least one folio.")
+	from kamra.api import _refuse_opening_balance
+	_refuse_opening_balance(charge_type)
 	from kamra.authz import require_cashier_pin
 	prop = frappe.db.get_value("Folio", folios[0], "property")
 	require_cashier_pin(prop, pin)
@@ -712,41 +2010,35 @@ def batch_print_folios(folios: str | list):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles("Front Desk", "Kamra Agent")
+@require_roles("Front Desk", "Night Auditor", "Kamra Agent")
 def quick_checkout(reservation: str, pin: str | None = None):
-	"""Settle + close folio + check out in one step when balance is zero
-	or fully covered by company credit."""
-	from kamra.api import close_folio, check_out
-	res = frappe.get_doc("Reservation", reservation)
+	"""Check out and close the guest folio in one step. check_out settles the
+	stay the one way: the company's folio (Company, or the group master)
+	moves to the city ledger when the company has credit, and the guest's
+	own folio must already be paid - liquor and extras are never billed to
+	the company."""
+	from kamra.api import check_out, close_folio
 	folio_name = frappe.db.get_value(
 		"Folio", {"reservation": reservation, "folio_type": "Guest",
 		          "status": "Open"}, "name")
 	if not folio_name:
 		frappe.throw("No open guest folio.")
-	folio = frappe.get_doc("Folio", folio_name)
-	if float(folio.balance or 0) > 0.009:
-		company = frappe.db.get_value(
-			"Reservation", reservation, "company")
-		if company and frappe.db.get_value(
-				"Company", company, "credit_allowed"):
-			transfer_to_city_ledger(folio_name, company)
-		else:
-			frappe.throw(
-				f"Balance ₹{float(folio.balance):,.2f} remains - collect payment "
-				"or transfer to city ledger first.")
+	out = check_out(reservation)
 	close_folio(folio_name, pin=pin)
-	return check_out(reservation)
+	return out
 
 
 @frappe.whitelist(methods=["POST"])
 @require_roles("Front Desk", "Kamra Agent")
-def group_checkout(group: str, pin: str | None = None):
-	"""Quick-checkout every Checked In reservation on a group."""
-	res_names = frappe.get_all(
-		"Reservation",
-		filters={"revenue_group": group, "status": "Checked In"},
-		pluck="name",
-	)
+def group_checkout(group: str, pin: str | None = None, reservations=None):
+	"""Quick-checkout every Checked In reservation on a group, or only the
+	`reservations` picked on the rooming list."""
+	if isinstance(reservations, str):
+		reservations = json.loads(reservations) if reservations.strip() else []
+	filters = {"group_booking": group, "status": "Checked In"}
+	if reservations:
+		filters["name"] = ("in", list(reservations))
+	res_names = frappe.get_all("Reservation", filters=filters, pluck="name")
 	results = []
 	for r in res_names:
 		try:
@@ -761,13 +2053,13 @@ def group_checkout(group: str, pin: str | None = None):
 @frappe.whitelist()
 @require_roles("Front Desk", "Finance", "Kamra Agent")
 def list_exchange_rates(property: str):
-	from frappe.utils import getdate
 	today = get_business_date(property)
 	rows = frappe.get_all(
 		"Exchange Rate",
 		filters={"property": property, "disabled": 0},
 		fields=["name", "currency", "rate_date", "buy_rate", "sell_rate",
-		        "service_tax_pct", "max_exchange"],
+		        "service_tax_pct", "max_exchange", "source", "set_by",
+		        "market_rate"],
 		order_by="currency asc, rate_date desc",
 	)
 	# Keep latest per currency
@@ -782,10 +2074,21 @@ def list_exchange_rates(property: str):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles("Finance", "Hotel Admin", "Kamra Agent")
+@require_roles("Finance", "Hotel Admin")  # payments convert at this: no agent sets it
 def upsert_exchange_rate(property: str, currency: str, buy_rate: float,
                          sell_rate: float, service_tax_pct: float = 0,
                          max_exchange: float | None = None):
+	"""Set today's (business date) rate for one foreign currency. Rates are
+	home-currency units per 1 foreign unit. A rate typed in here is Manual
+	and wins over a fetched (Online) one for the same day: a later fetch
+	leaves it alone."""
+	currency = (currency or "").strip().upper()
+	if len(currency) != 3 or not currency.isalpha():
+		frappe.throw("Currency must be a 3-letter ISO code, e.g. USD.")
+	if currency == home_currency(property):
+		frappe.throw(f"{currency} is this hotel's own currency.")
+	if float(buy_rate or 0) <= 0 or float(sell_rate or 0) <= 0:
+		frappe.throw("Buy and sell rates must be above zero.")
 	bd = get_business_date(property)
 	existing = frappe.db.get_value(
 		"Exchange Rate",
@@ -798,6 +2101,9 @@ def upsert_exchange_rate(property: str, currency: str, buy_rate: float,
 		doc.sell_rate = float(sell_rate)
 		doc.service_tax_pct = float(service_tax_pct or 0)
 		doc.max_exchange = max_exchange
+		doc.source = "Manual"
+		doc.set_by = frappe.session.user
+		doc.market_rate = None
 		doc.save(ignore_permissions=True)
 	else:
 		doc = frappe.get_doc({
@@ -809,25 +2115,182 @@ def upsert_exchange_rate(property: str, currency: str, buy_rate: float,
 			"sell_rate": float(sell_rate),
 			"service_tax_pct": float(service_tax_pct or 0),
 			"max_exchange": max_exchange,
+			"source": "Manual",
+			"set_by": frappe.session.user,
 		})
 		doc.insert(ignore_permissions=True)
 	return doc.as_dict()
+
+
+# Online rates: ExchangeRate-API's free open endpoint. No key, HTTPS, covers
+# INR, SAR, AED, USD and ~160 more. Terms (exchangerate-api.com/docs/free):
+# free use, rates refresh once a day, rate limited (do not call more than
+# about hourly), and a page showing the rates must credit "Rates By Exchange
+# Rate API" with a link. Response shape:
+#   {"result": "success", "base_code": "INR",
+#    "time_last_update_utc": "Thu, 29 Oct 2026 00:02:31 +0000",
+#    "rates": {"INR": 1, "USD": 0.01189, ...}}   # foreign units per 1 base
+# and on failure {"result": "error", "error-type": "unsupported-code"}.
+# Swap the provider here; market_rates() is the only reader.
+FX_RATES_URL = "https://open.er-api.com/v6/latest/{base}"
+FX_TIMEOUT_S = 5
+FX_MAX_BYTES = 256 * 1024  # the real reply is ~4 KB
+
+
+def market_rates(home: str) -> tuple[dict, str | None]:
+	"""Market mid rates as home-currency units per 1 foreign unit, and the
+	provider's as-of time. Throws a plain message on any failure; never
+	called from a request that takes a payment. The reply is untrusted:
+	size-capped, its base must be our home currency, and a rate that isn't
+	a finite positive number is dropped."""
+	import math
+
+	import requests
+	try:
+		if not (len(home) == 3 and home.isalpha()):
+			raise ValueError(f"home currency {home!r} is not an ISO code")
+		r = requests.get(FX_RATES_URL.format(base=home.upper()), timeout=FX_TIMEOUT_S,
+		                 stream=True, allow_redirects=False)
+		r.raise_for_status()
+		body = r.raw.read(FX_MAX_BYTES + 1, decode_content=True)
+		if len(body) > FX_MAX_BYTES:
+			raise ValueError("reply too large")
+		data = json.loads(body)
+		if data.get("result") != "success":
+			raise ValueError(data.get("error-type") or "no rates returned")
+		if str(data.get("base_code") or "").upper() != home.upper():
+			raise ValueError(f"rates are for {data.get('base_code')}, not {home}")
+		mids = {}
+		for c, v in (data.get("rates") or {}).items():
+			try:
+				mid = 1 / float(v)
+			except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+				continue
+			if math.isfinite(mid) and mid > 0:
+				mids[str(c).upper()] = mid
+	except Exception as e:
+		frappe.throw(f"Could not fetch exchange rates ({type(e).__name__}: {e}). "
+		             "Today's rates are unchanged; type them in on the Currency Desk.")
+	return mids, data.get("time_last_update_utc")
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Finance", "Hotel Admin")
+def fetch_exchange_rates(property: str):
+	"""Fetch today's market rates for the property's listed currencies
+	(Settings, Finance, Exchange rates) and store them for the business
+	date: buy = mid less the margin, sell = mid plus it. A Manual rate
+	already set for today is kept."""
+	return _fetch_rates(property)
+
+
+def _fetch_rates(property: str, only_missing: bool = False) -> dict:
+	from kamra.settings import get_setting, list_setting
+	home = home_currency(property)
+	wanted = [c.upper() for c in list_setting(property, "fx_currencies")
+	          if len(c) == 3 and c.isalpha() and c.upper() != home]
+	if not wanted:
+		frappe.throw("No foreign currencies listed. Add them under Settings, "
+		             "Finance, Exchange rates.")
+	bd = get_business_date(property)
+	existing = {r.currency: r for r in frappe.get_all(
+		"Exchange Rate",
+		filters={"property": property, "rate_date": bd, "currency": ["in", wanted]},
+		fields=["name", "currency", "source"])}
+	out = {"business_date": str(bd), "updated": [], "kept_manual": [],
+	       "not_offered": [], "as_of": None}
+	skip_key = f"kamra:fx_not_offered:{property}:{bd}"
+	if only_missing:
+		skipped = set(frappe.cache.get_value(skip_key) or ())
+		wanted = [c for c in wanted if c not in existing and c not in skipped]
+		if not wanted:
+			return out
+		mids, out["as_of"] = _market_rates_hourly(home)
+	else:
+		mids, out["as_of"] = market_rates(home)
+	margin = float(get_setting(property, "fx_margin_pct") or 0) / 100
+	for cur in wanted:
+		row = existing.get(cur)
+		if row and (row.source or "Manual") == "Manual":
+			out["kept_manual"].append(cur)
+			continue
+		mid = mids.get(cur)
+		if not mid:
+			out["not_offered"].append(cur)
+			continue
+		# 9 places: a weak currency (JPY, IDR) is a tiny rate against a strong home
+		values = {"buy_rate": round(mid * (1 - margin), 9),
+		          "sell_rate": round(mid * (1 + margin), 9),
+		          "market_rate": round(mid, 9), "source": "Online",
+		          "set_by": frappe.session.user}
+		if row:
+			doc = frappe.get_doc("Exchange Rate", row.name)
+			doc.update(values)
+			doc.save(ignore_permissions=True)
+		else:
+			# carry the desk's FX tax and per-transaction limit forward
+			prev = frappe.db.get_value(
+				"Exchange Rate", {"property": property, "currency": cur},
+				["service_tax_pct", "max_exchange"], as_dict=True,
+				order_by="rate_date desc") or {}
+			frappe.get_doc({"doctype": "Exchange Rate", "property": property,
+			                "currency": cur, "rate_date": bd,
+			                "service_tax_pct": prev.get("service_tax_pct") or 0,
+			                "max_exchange": prev.get("max_exchange"),
+			                **values}).insert(ignore_permissions=True)
+		out["updated"].append(cur)
+	if only_missing and out["not_offered"]:
+		# the provider lacks it: stop asking every hour until the date rolls
+		frappe.cache.set_value(skip_key, sorted(skipped | set(out["not_offered"])),
+		                       expires_in_sec=86400)
+	return out
+
+
+def _market_rates_hourly(home: str) -> tuple[dict, str | None]:
+	"""market_rates for the scheduler: one provider call per home currency
+	an hour, however many properties share it (the provider asks for no
+	more than about hourly). A failure is not cached."""
+	key = f"kamra:fx_market:{home}"
+	hit = frappe.cache.get_value(key)
+	if hit:
+		return hit[0], hit[1]
+	mids, as_of = market_rates(home)
+	frappe.cache.set_value(key, [mids, as_of], expires_in_sec=3600)
+	return mids, as_of
+
+
+def auto_fetch_exchange_rates():
+	"""Hourly: for properties that turned on the daily fetch, fill in any
+	listed currency with no rate yet for the business date. Runs again
+	next hour if the provider was down, and after the night audit rolls
+	the date."""
+	from kamra.settings import get_setting
+	for prop in frappe.get_all("Property", filters={"disabled": 0}, pluck="name"):
+		if not get_setting(prop, "fx_auto_fetch"):
+			continue
+		try:
+			_fetch_rates(prop, only_missing=True)
+			frappe.db.commit()  # nosemgrep: frappe-manual-commit -- one property's rates stand even if a later property fails
+		except Exception:
+			frappe.db.rollback()
+			frappe.log_error(title=f"Exchange rate fetch failed: {prop}",
+			                 message=frappe.get_traceback())
 
 
 @frappe.whitelist()
 @require_roles("Front Desk", "Finance", "Kamra Agent")
 def currency_calculator(property: str, currency: str, fx_amount: float,
                         direction: str = "Buy"):
-	rate_row = frappe.get_all(
+	currency = (currency or "").strip().upper()
+	bd = get_business_date(property)
+	# today's rate only, like payment_rate: an old rate is refused, not reused
+	rate_row = frappe.db.get_value(
 		"Exchange Rate",
-		filters={"property": property, "currency": currency, "disabled": 0},
-		fields=["buy_rate", "sell_rate", "service_tax_pct", "max_exchange"],
-		order_by="rate_date desc",
-		limit_page_length=1,
-	)
-	rate_row = rate_row[0] if rate_row else None
+		{"property": property, "currency": currency, "rate_date": bd, "disabled": 0},
+		["buy_rate", "sell_rate", "service_tax_pct", "max_exchange"], as_dict=True)
 	if not rate_row:
-		frappe.throw(f"No exchange rate for {currency}.")
+		frappe.throw(f"No {currency} rate set for {bd}. Finance fetches "
+		             "or types today's rate on the Currency Desk first.")
 	rate = float(rate_row.buy_rate if direction == "Buy" else rate_row.sell_rate)
 	local = float(fx_amount) * rate
 	tax = local * float(rate_row.service_tax_pct or 0) / 100.0
@@ -849,12 +2312,12 @@ def post_exchange(property: str, currency: str, fx_amount: float,
                   direction: str = "Buy", folio: str | None = None,
                   guest: str | None = None, pin: str | None = None):
 	from kamra.authz import require_cashier_pin
-	from kamra.cashier import require_open_session, record_cashier_txn
+	from kamra.cashier import record_cashier_txn, require_open_session
 	require_cashier_pin(property, pin)
 	calc = currency_calculator(property, currency, fx_amount, direction)
 	if calc.get("max_exchange") and float(fx_amount) > float(calc["max_exchange"]):
 		frappe.throw("Exceeds per-transaction FX limit.")
-	sess = require_open_session(property)
+	sess = require_open_session(property, till_only=True)
 	bd = get_business_date(property)
 	txn = frappe.get_doc({
 		"doctype": "Exchange Transaction",
@@ -881,23 +2344,74 @@ def post_exchange(property: str, currency: str, fx_amount: float,
 		notes=f"{direction} {fx_amount} {currency} @ {calc['exchange_rate']}",
 		session=sess,
 	)
-	if folio and direction == "Sell":
-		# Optionally record as folio payment in foreign currency
-		fdoc = frappe.get_doc("Folio", folio)
-		fdoc.append("payments", {
-			"posting_date": bd,
-			"payment_kind": "Payment",
-			"mode": "Cash",
-			"amount": calc["local_amount"],
-			"currency": currency.upper(),
-			"fx_amount": float(fx_amount),
-			"exchange_rate": calc["exchange_rate"],
-			"reference": f"fx:{txn.name}",
-		})
-		from kamra.folio import _recalculate
-		_recalculate(fdoc)
-		fdoc.save(ignore_permissions=True)
+	# ponytail: folio here is only a reference. Paying a bill in foreign
+	# money is api.add_folio_payment(currency=...), the one payment writer.
 	return {"transaction": txn.name, **calc}
+
+
+def home_currency(property: str) -> str:
+	"""The currency the hotel's books are kept in."""
+	from kamra import localization as loc
+	return (frappe.get_cached_value("Property", property, "currency")
+	        or loc.default_currency(loc.pack_for(property)))
+
+
+def _money(value) -> Decimal:
+	return Decimal(str(value or 0))
+
+
+def round_cents(value) -> float:
+	"""Half up to the cent, in Decimal (float round(2.345, 2) gives 2.34)."""
+	return float(_money(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def fx_to_home(fx_amount, rate) -> float:
+	"""Foreign money received -> home amount posted. Half up to the cent."""
+	return float((_money(fx_amount) * _money(rate)).quantize(
+		Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def home_to_fx(amount, rate) -> float:
+	"""Home amount -> foreign amount shown to the guest. Rounded UP to the
+	cent so paying the shown figure always settles the bill; any extra is
+	change, given back in home currency."""
+	return float((_money(amount) / _money(rate)).quantize(
+		Decimal("0.01"), rounding=ROUND_UP))
+
+
+def payment_rate(property: str, currency: str) -> dict:
+	"""The rate a foreign-currency payment converts at: the hotel's BUY
+	rate (it is buying the guest's foreign money) set for the current
+	business date. A rate from an earlier day is refused, not reused."""
+	currency = (currency or "").strip().upper()
+	if currency == home_currency(property):
+		frappe.throw(f"{currency} is this hotel's own currency.")
+	bd = get_business_date(property)
+	row = frappe.db.get_value(
+		"Exchange Rate",
+		{"property": property, "currency": currency, "rate_date": bd,
+		 "disabled": 0},
+		["buy_rate", "rate_date"], as_dict=True)
+	if not row or float(row.buy_rate or 0) <= 0:
+		frappe.throw(f"No {currency} rate set for {bd}. Finance fetches "
+		             "or types today's rate on the Currency Desk first.")
+	return {"currency": currency, "rate": float(row.buy_rate),
+	        "rate_date": str(row.rate_date)}
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Finance", "Night Auditor", "Kamra Agent")
+def folio_in_currency(folio: str, currency: str):
+	"""A folio's total and balance shown in another currency, at today's
+	rate. Display only: the bill and tax invoice stay in home currency."""
+	doc = frappe.get_doc("Folio", folio)
+	r = payment_rate(doc.property, currency)
+	return {
+		**r,
+		"home_currency": home_currency(doc.property),
+		"grand_total": home_to_fx(doc.grand_total, r["rate"]),
+		"balance": home_to_fx(max(float(doc.balance or 0), 0), r["rate"]),
+	}
 
 
 @frappe.whitelist()
@@ -929,6 +2443,9 @@ DEFAULT_REASONS = [
 	("REF-OVER", "Overpayment refund", "Refund", 0),
 	("PO-VENDOR", "Vendor paid-out", "Paid Out", 0),
 	("NC-MGMT", "Management NC", "NC", 1),
+	("REV-BOUNCE", "Cheque bounced", "Payment Reversal", 0),
+	("REV-ACCOUNT", "Posted to the wrong account", "Payment Reversal", 0),
+	("REV-ERR", "Entered in error", "Payment Reversal", 0),
 ]
 
 
@@ -946,7 +2463,7 @@ def ensure_default_reason_codes() -> None:
 
 
 @frappe.whitelist()
-@require_roles("Front Desk", "Finance", "Kamra Agent")
+@require_roles("Front Desk", "Finance", "F&B Manager", "Kamra Agent")  # POS void reasons
 def list_reason_codes(category: str | None = None):
 	ensure_default_reason_codes()
 	filters: dict[str, Any] = {"disabled": 0}
@@ -974,18 +2491,16 @@ def require_reason(category: str, reason_code: str | None, free_text: str = "",
 		if row.category != category:
 			frappe.throw(f"Reason code is for {row.category}, not {category}.")
 		if row.requires_supervisor:
-			# Supervisor = Hotel Admin PIN or a second user's PIN via pin check
-			if not supervisor_pin:
-				frappe.throw("SUPERVISOR_PIN_REQUIRED: this reason needs approval.")
-			# Accept any valid cashier PIN from a Finance/Admin user by
-			# temporarily validating against the current user's PIN is wrong;
-			# instead require the property's require_cashier_pin path with a
-			# flag. Practical approach: Hotel Admin / Finance role + their PIN.
 			roles = set(frappe.get_roles())
 			if not (roles & {"Hotel Admin", "Finance", "System Manager",
 			                 "Administrator"}):
-				frappe.throw("Supervisor role required for this reason.")
-			from kamra.authz import require_cashier_pin
-			if property:
-				require_cashier_pin(property, supervisor_pin)
+				frappe.throw("Supervisor role required for this reason.", frappe.PermissionError)
+			pin_required = not property or bool(frappe.db.get_value(
+				"Property", property, "require_cashier_pin"))
+			if pin_required:
+				if not supervisor_pin:
+					frappe.throw("SUPERVISOR_PIN_REQUIRED: this reason needs approval.")
+				from kamra.authz import require_cashier_pin
+				if property:
+					require_cashier_pin(property, supervisor_pin)
 	return reason_code or free_text.strip()[:140]

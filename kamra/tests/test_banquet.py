@@ -571,7 +571,7 @@ class TestBanquetOps(BanquetTestCase):
 		)
 		self.assertGreaterEqual(len(tasks), 4)
 		depts = {t.department for t in tasks}
-		self.assertTrue({"Sales", "Finance", "Housekeeping", "F&B"} <= depts)
+		self.assertLessEqual({"Sales", "Finance", "Housekeeping", "F&B"}, depts)
 
 	def test_confirm_via_set_status_also_spawns_checklists(self):
 		fn = self._quoted()
@@ -597,8 +597,9 @@ class TestBanquetOps(BanquetTestCase):
 		self.assertTrue(row.completed_on)
 
 	def test_quote_no_response_alert_after_three_days(self):
-		from kamra import banquet_ops as ops
 		from frappe.utils import add_days, now_datetime
+
+		from kamra import banquet_ops as ops
 
 		fn = self._quoted()
 		frappe.flags.mute_emails = True
@@ -995,6 +996,16 @@ class TestDocumentCompliance(BanquetTestCase):
 		self.assertIn("computer-generated", h["footer"])
 		self.assertEqual(h["place_of_supply"], "Karnataka")
 		self.assertEqual(h["tax_id_label"], "GSTIN")
+
+	def test_the_hotels_own_footer_prints_under_the_statutory_one(self):
+		# a private limited company owes its CIN on every invoice, and a
+		# corporate payer wants the bank details to transfer to
+		note = "CIN: U55100TN2022PTC151477\nBank: HDFC · A/c 123 · IFSC HDFC0000001"
+		frappe.db.set_value("Property", PROPERTY, "invoice_footer", note)
+		self.addCleanup(frappe.db.set_value, "Property", PROPERTY, "invoice_footer", None)
+		h =bq.banquet_document(self._sold(), "invoice")["header"]
+		self.assertEqual(h["invoice_footer"], note)
+		self.assertIn("computer-generated", h["footer"])   # still there
 
 	def test_an_unsold_function_cannot_be_invoiced(self):
 		fn = enquiry(self.f)

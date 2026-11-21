@@ -1,8 +1,10 @@
-import { useNavigate } from "react-router-dom"
+import { useNavigate, useOutletContext } from "react-router-dom"
 import { Store } from "lucide-react"
 
 import { useAuth } from "../lib/auth"
-import { APP_TILE, visibleApps, type AppDef } from "../lib/apps"
+import type { ShellContext } from "../AppShell"
+import { APP_TILE, useConnectedApps, visibleApps, type AppDef } from "../lib/apps"
+import ConnectedAppIcon from "../components/ConnectedAppIcon"
 import { cn } from "../lib/utils"
 import { useT } from "../lib/i18n"
 
@@ -12,14 +14,18 @@ export default function AppLauncher() {
   const { t } = useT()
   const { roles } = useAuth()
   const navigate = useNavigate()
-  const apps = visibleApps(roles)
+  // only the apps this property runs (enabled_modules, empty = all) -
+  // the same rule as the sidebar and the MCP tool list
+  const { modules } = useOutletContext<ShellContext>()
+  const apps = visibleApps(roles, modules)
+  const connected = useConnectedApps()
   const canMarket = ["Hotel Admin", "System Manager", "Administrator"].some(
     (r) => roles.includes(r),
   )
 
   const open = (app: AppDef) => {
     const first = app.items.find((i) => i.to)
-    if (first?.to) navigate(first.to)
+    if (first?.to) navigate(first.to, { state: { app: app.id } })
   }
 
   return (
@@ -55,6 +61,28 @@ export default function AppLauncher() {
           </button>
         ))}
       </div>
+
+      {connected.length > 0 && (
+        <section className="space-y-2">
+          <h2 className="text-sm font-semibold text-zinc-700">{t("Connected apps")}</h2>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {connected.map((app) => (
+              <a
+                key={app.app_id}
+                href={app.url}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-3 rounded-lg border border-zinc-200 bg-white p-3.5 text-left transition-colors hover:border-zinc-300 hover:bg-zinc-50"
+              >
+                <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-md", APP_TILE)}>
+                  <ConnectedAppIcon src={app.icon} />
+                </span>
+                <span className="min-w-0 truncate text-sm font-semibold text-zinc-900">{app.name}</span>
+              </a>
+            ))}
+          </div>
+        </section>
+      )}
 
       {canMarket && (
         <button

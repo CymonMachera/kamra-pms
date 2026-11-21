@@ -6,6 +6,10 @@ from decimal import Decimal
 
 import frappe
 
+# foreign currencies a property takes until Settings, Finance, Exchange rates
+# says otherwise; a pack lists its own (kamra.settings.fx_currencies_default)
+FX_CURRENCIES = ["USD", "EUR", "GBP", "AED", "SAR", "SGD", "AUD", "JPY"]
+
 
 def calculate_room_tax(property, room_type_doc, nightly_rate) -> Decimal:
 	prop = frappe.get_cached_doc("Property", property)
@@ -18,6 +22,12 @@ def fnb_tax_rate(property) -> float:
 
 
 def tax_rate_options(property) -> list:
+	# a property that charges no tax (its rates are 0) offers only 0%, so a
+	# charge added by hand can't pick up a tax by mistake
+	if property:
+		prop = frappe.get_cached_doc("Property", property)
+		if not float(prop.get("gst_rate_low") or 0) and not float(prop.get("gst_rate_high") or 0):
+			return [0]
 	return [0, 5, 10, 12, 15, 20]
 
 

@@ -8,8 +8,10 @@ import {
   type ReactNode,
 } from "react"
 import { call, getCurrentProperty } from "./api"
+import { useAuth } from "./auth"
 import { serverError } from "./resource"
 import { PinPad } from "../components/PinPad"
+import { t as translate, useUILanguage } from "./i18n"
 
 type PinStatus = {
   required: boolean
@@ -17,6 +19,8 @@ type PinStatus = {
   must_reset: boolean
   locked: boolean
   unlocked: boolean
+  /** How long an unlock lasts at this property (Settings → Finance). */
+  unlock_minutes?: number
 }
 
 type CashierAuth = {
@@ -31,6 +35,10 @@ type CashierAuth = {
 const Ctx = createContext<CashierAuth | null>(null)
 
 export function CashierAuthProvider({ children }: { children: ReactNode }) {
+  useUILanguage()
+  // the PIN status belongs to a signed-in user: asking before login only
+  // earns a 403 from the server
+  const { status: authStatus } = useAuth()
   const [status, setStatus] = useState<PinStatus | null>(null)
   const [padOpen, setPadOpen] = useState(false)
   const [padMode, setPadMode] = useState<"unlock" | "enroll">("unlock")
@@ -53,8 +61,9 @@ export function CashierAuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    void refresh()
-  }, [refresh])
+    if (authStatus === "authed") void refresh()
+    else setStatus(null)
+  }, [refresh, authStatus])
 
   const finishOk = useCallback(() => {
     setPadOpen(false)
@@ -105,7 +114,7 @@ export function CashierAuthProvider({ children }: { children: ReactNode }) {
           return
         }
         if (s.locked) {
-          reject(new Error("PIN locked — try again later."))
+          reject(new Error("PIN locked - try again later."))
           return
         }
         setPadMode(s.has_pin && !s.must_reset ? "unlock" : "enroll")
@@ -119,7 +128,7 @@ export function CashierAuthProvider({ children }: { children: ReactNode }) {
   const withPin = useCallback(
     async <T,>(fn: (pin?: string) => Promise<T>) => {
       await ensureUnlocked()
-      // Unlock window is active — backends accept missing pin.
+      // Unlock window is active - backends accept missing pin.
       return fn(undefined)
     },
     [ensureUnlocked],
@@ -136,11 +145,11 @@ export function CashierAuthProvider({ children }: { children: ReactNode }) {
       <PinPad
         open={padOpen}
         mode={padMode}
-        title={padMode === "enroll" ? "Set your cashier PIN" : "Cashier PIN"}
+        title={(padMode === "enroll" ? translate("Set your cashier PIN") : translate("Cashier PIN"))}
         subtitle={
-          padMode === "enroll"
-            ? "4–8 digits. Required for money actions at this property."
-            : "Unlocks your till for 15 minutes."
+          (padMode === "enroll"
+            ? translate("4-8 digits. Required for money actions at this property.")
+            : translate("Unlocks your till for {v0} minutes.", { v0: String(status?.unlock_minutes ?? 15) }))
         }
         error={padError}
         busy={busy}

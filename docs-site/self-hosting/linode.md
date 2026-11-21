@@ -18,7 +18,7 @@ StackScript notes: `deploy/linode/` in the Kamra repo.
 
 ### 1. Create the server
 
-**Linode** → Ubuntu 24.04 → **Shared CPU / 4 GB** (~$24/mo) → region + SSH key.
+**Linode** → Ubuntu 24.04 → **Shared CPU / 4 GB** (~$24/mo; 8 GB builds faster) → region + SSH key.
 
 ### 2. DNS
 
@@ -31,7 +31,7 @@ ssh root@<server-ip>
 curl -fsSL https://raw.githubusercontent.com/Kamra-PMS/kamra-pms/main/deploy/install.sh | bash
 ```
 
-Site domain, admin email, admin password — no default.
+Site domain, admin email, admin password - no default.
 
 ### 4. TLS
 

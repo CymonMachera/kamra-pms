@@ -3,24 +3,26 @@ import { WifiOff } from "lucide-react"
 import { whoami } from "../lib/api"
 import { useT } from "../lib/i18n"
 
-/** A single, calm strip when the server can't be reached — instead of raw
+/** A single, calm strip when the server can't be reached - instead of raw
  * fetch errors scattered across screens. The api layer emits kamra:offline
  * on network failure and kamra:online on any success; while offline we ping
  * quietly until the server answers, then the strip disappears and the
  * screens' own polling/realtime refetch recovers the data. */
 export default function ConnectionBanner() {
   const { t } = useT()
-  const [offline, setOffline] = useState(false)
+  const [offline, setOffline] = useState(() => !navigator.onLine)
 
   useEffect(() => {
     const off = () => setOffline(true)
     const on = () => setOffline(false)
     window.addEventListener("kamra:offline", off)
     window.addEventListener("kamra:online", on)
+    window.addEventListener("offline", off) // the device lost its network
     window.addEventListener("online", off) // browser back online → verify
     return () => {
       window.removeEventListener("kamra:offline", off)
       window.removeEventListener("kamra:online", on)
+      window.removeEventListener("offline", off)
       window.removeEventListener("online", off)
     }
   }, [])
@@ -41,7 +43,7 @@ export default function ConnectionBanner() {
       className="fixed inset-x-0 top-0 z-[100] flex items-center justify-center gap-2 bg-amber-500 px-4 py-1.5 text-sm font-medium text-white shadow"
     >
       <WifiOff className="size-4" aria-hidden />
-      {t("Connection lost — reconnecting…")}
+      {t("Connection lost - reconnecting…")}
     </div>
   )
 }

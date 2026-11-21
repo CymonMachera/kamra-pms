@@ -26,6 +26,19 @@ import frappe
 
 DEFAULT_PBJT = Decimal("10")
 
+DEFAULT_CURRENCY = "IDR"
+# foreign money guests bring most; Settings, Finance, Exchange rates can change it
+FX_CURRENCIES = ["USD", "SGD", "AUD", "EUR", "JPY", "CNY", "MYR", "SAR"]
+DEFAULT_TIMEZONE = "Asia/Jakarta"
+DEFAULT_NATIONALITY = "Indonesian"
+# a passport or ID card MRZ names the country by this code
+HOME_COUNTRY_ISO3 = "IDN"
+ID_TYPES = ["KTP", "Passport", "KITAS", "Driving License", "Other"]
+# QRIS settles like a card through the acquirer - book it as Card
+PAYMENT_MODES = ["Cash", "Card", "Bank Transfer"]
+# notes and coins the till counts at close, largest first
+CASH_DENOMINATIONS = (100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100)
+
 
 def calculate_room_tax(property, room_type_doc, nightly_rate) -> Decimal:
 	"""PBJT is flat - no slabs, no per-tariff switching. The room type's

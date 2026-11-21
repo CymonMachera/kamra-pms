@@ -2,6 +2,9 @@
 
 Read-only diagnostics for Admin → System Health. Upgrade is guided (bench /
 Docker / Frappe Cloud) — we never mutate the install from this screen.
+
+Also powers a WordPress-style update nag: a scheduled GitHub poll warms the
+cache, and admins see an in-app banner when the site is behind latest stable.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import frappe
-from frappe.utils import cint
+from frappe.utils import add_to_date, cint, get_datetime, now_datetime
 
 from kamra import __version__ as KAMRA_VERSION
 from kamra.authz import require_roles
@@ -22,7 +25,13 @@ GITHUB_REPO = "Kamra-PMS/kamra-pms"
 GITHUB_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES = f"https://github.com/{GITHUB_REPO}/releases"
 CACHE_KEY = "kamra:github_latest_release"
-CACHE_TTL = 3600  # 1 hour — polite to GitHub's unauthenticated rate limit
+# Outlives the twice-daily scheduler poll, so admins never wait on GitHub.
+CACHE_TTL = 13 * 3600
+# A failed fetch is cached too: an offline site must not hold a worker for
+# the full timeout on every admin page load.
+FAIL_TTL = 3600
+# Per-user dismiss / snooze for the in-app update nag (DefaultValue).
+NAG_DISMISS_KEY = "kamra_update_nag_dismiss"
 
 
 def _parse_semver(tag: str) -> tuple[int, int, int] | None:
@@ -47,7 +56,7 @@ def _cmp_semver(a: str, b: str) -> int | None:
 
 def _fetch_github_latest() -> dict:
 	cached = frappe.cache.get_value(CACHE_KEY)
-	if isinstance(cached, dict) and cached.get("tag"):
+	if isinstance(cached, dict):
 		return cached
 
 	req = Request(
@@ -62,7 +71,7 @@ def _fetch_github_latest() -> dict:
 		with urlopen(req, timeout=8) as resp:  # nosemgrep: python.lang.security - public GitHub API over HTTPS
 			payload = json.loads(resp.read().decode("utf-8"))
 	except (HTTPError, URLError, TimeoutError, ValueError, OSError) as e:
-		return {
+		failed = {
 			"ok": False,
 			"error": str(e)[:200],
 			"tag": None,
@@ -70,6 +79,8 @@ def _fetch_github_latest() -> dict:
 			"url": GITHUB_RELEASES,
 			"published_at": None,
 		}
+		frappe.cache.set_value(CACHE_KEY, failed, expires_in_sec=FAIL_TTL)
+		return failed
 
 	tag = (payload.get("tag_name") or "").strip()
 	out = {
@@ -257,6 +268,163 @@ def _version_check(latest: dict) -> dict:
 	)
 
 
+def _upgrade_payload() -> dict:
+	return {
+		"docs": "https://kamrapms.com/docs/self-hosting/",
+		"releases": GITHUB_RELEASES,
+		"docker_latest": "ghcr.io/kamra-pms/kamra:latest",
+		"docker_nightly": "ghcr.io/kamra-pms/kamra:nightly",
+		# Hard rule: no backup, no update. Docker install.sh update already
+		# aborts if backup fails; bench operators must do the same first step.
+		"bench": (
+			"bench --site <site> backup --with-files && "
+			"bench get-app kamra https://github.com/Kamra-PMS/kamra-pms "
+			"--branch main && bench --site <site> migrate && bench build "
+			"--app kamra && bench restart"
+		),
+		"note": (
+			"Kamra does not auto-upgrade or downgrade the site from this "
+			"screen. Rule: take a full backup before every update — if the "
+			"backup fails, stop. Docker: sudo /opt/kamra/install.sh update "
+			"(backs up first, aborts on failure). Bench: run "
+			"`bench --site <site> backup --with-files` before migrate. "
+			"To leave a newer tag, pin the previous vX.Y.Z with "
+			"KAMRA_TAG=… install.sh update (see docs: Going back). "
+			"Frappe Cloud: create a Marketplace release from main."
+		),
+	}
+
+
+def _is_behind(latest: dict) -> bool:
+	"""True when installed Kamra is a lower SemVer than GitHub latest stable."""
+	tag = latest.get("tag") if latest.get("ok") else None
+	if not tag:
+		return False
+	cmp = _cmp_semver(KAMRA_VERSION, tag)
+	return cmp is not None and cmp < 0
+
+
+def _read_nag_dismiss(user: str | None = None) -> dict | None:
+	raw = frappe.defaults.get_user_default(
+		NAG_DISMISS_KEY, user=user or frappe.session.user,
+	)
+	if not raw:
+		return None
+	try:
+		data = json.loads(raw) if isinstance(raw, str) else raw
+	except (TypeError, ValueError):
+		return None
+	return data if isinstance(data, dict) else None
+
+
+def _nag_is_dismissed(tag: str) -> bool:
+	"""Hidden when this tag was dismissed, or snoozed until a future time."""
+	data = _read_nag_dismiss()
+	if not data:
+		return False
+	dismissed_tag = (data.get("tag") or "").strip()
+	if not dismissed_tag:
+		return False
+	# A newer GitHub release than the one we dismissed → show again.
+	cmp = _cmp_semver(dismissed_tag, tag)
+	if cmp is not None and cmp < 0:
+		return False
+	if dismissed_tag != tag:
+		return False
+	until = data.get("until")
+	if until:
+		try:
+			return get_datetime(until) > now_datetime()
+		except Exception:
+			return False
+	# Permanent dismiss for this exact tag (until a newer release).
+	return True
+
+
+def poll_github_releases():
+	"""Scheduler: refresh the GitHub latest-release cache (no UI side effects)."""
+	frappe.cache.delete_value(CACHE_KEY)
+	_fetch_github_latest()
+
+
+@frappe.whitelist()
+@require_roles("Hotel Admin", "System Manager", "Administrator")
+def update_nag():
+	"""Lightweight check for the in-app update banner (admins only)."""
+	# Shared playground installs are not upgradable by the visitor.
+	if frappe.db.get_default("kamra_demo_mode") == "1":
+		return {"available": False, "reason": "demo"}
+
+	latest = _fetch_github_latest()
+	if not _is_behind(latest):
+		return {
+			"available": False,
+			"installed": KAMRA_VERSION,
+			"latest": latest,
+		}
+
+	tag = latest.get("tag") or ""
+	if _nag_is_dismissed(tag):
+		return {
+			"available": False,
+			"reason": "dismissed",
+			"installed": KAMRA_VERSION,
+			"latest": latest,
+		}
+
+	return {
+		"available": True,
+		"installed": KAMRA_VERSION,
+		"latest": latest,
+		"upgrade": _upgrade_payload(),
+	}
+
+
+@frappe.whitelist()
+@require_roles("Hotel Admin", "System Manager", "Administrator")
+def dismiss_update_nag(tag: str, snooze_days: int = 0):
+	"""Hide the nag for this release.
+
+	snooze_days > 0 → remind later. snooze_days == 0 → dismiss until a newer
+	GitHub release appears.
+	"""
+	tag = (tag or "").strip()
+	if not tag:
+		frappe.throw("Missing release tag.")
+
+	payload: dict = {"tag": tag}
+	days = cint(snooze_days)
+	if days > 0:
+		payload["until"] = str(
+			add_to_date(now_datetime(), days=min(days, 90)),
+		)
+
+	frappe.defaults.set_user_default(NAG_DISMISS_KEY, json.dumps(payload))
+	return {"ok": True, "dismissed": payload}
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("System Manager", "Administrator")
+def take_site_backup(with_files: int = 1):
+	"""Full site backup before an update. Hard rule: operators (and
+	`deploy/update-bench.sh` / `install.sh update`) must succeed here
+	before migrate. Returns the archive paths under private/backups."""
+	from frappe.utils.backups import new_backup
+
+	backup = new_backup(ignore_files=not cint(with_files))
+	# new_backup returns a BackupGenerator; expose the paths Desk lists.
+	paths = {
+		"database": getattr(backup, "backup_path_db", None),
+		"public_files": getattr(backup, "backup_path_files", None),
+		"private_files": getattr(backup, "backup_path_private_files", None),
+		"config": getattr(backup, "backup_path_conf", None),
+		"site": frappe.local.site,
+		"with_files": bool(cint(with_files)),
+	}
+	frappe.logger("kamra").info(f"take_site_backup ok site={paths['site']}")
+	return paths
+
+
 @frappe.whitelist()
 @require_roles("Hotel Admin", "System Manager", "Administrator")
 def system_health(refresh: int = 0):
@@ -296,21 +464,6 @@ def system_health(refresh: int = 0):
 			"site": frappe.local.site,
 		},
 		"latest": latest,
-		"upgrade": {
-			"docs": "https://kamrapms.com/docs/self-hosting/",
-			"releases": GITHUB_RELEASES,
-			"docker_latest": "ghcr.io/kamra-pms/kamra:latest",
-			"docker_nightly": "ghcr.io/kamra-pms/kamra:nightly",
-			"bench": (
-				"bench get-app kamra https://github.com/Kamra-PMS/kamra-pms "
-				"--branch main && bench --site <site> migrate && bench build "
-				"--app kamra && bench restart"
-			),
-			"note": (
-				"Kamra does not auto-upgrade the site from this screen. "
-				"Self-host: pull the new image or bench update, then migrate. "
-				"Frappe Cloud: create a Marketplace release from main."
-			),
-		},
+		"upgrade": _upgrade_payload(),
 		"checks": checks,
 	}

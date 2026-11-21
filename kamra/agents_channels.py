@@ -32,7 +32,6 @@ import frappe
 from kamra import savings
 from kamra.authz import require_roles
 
-
 # ---------------------------------------------------------------------------
 # Inbound webhooks
 # ---------------------------------------------------------------------------
@@ -319,7 +318,7 @@ def _authenticate(channel: str, body: dict):
 	conn = frappe.get_doc("Channel Provider Connection", conn_rows[0])
 
 	secret = conn.get_password("webhook_secret", raise_exception=False)
-	if secret and not _verify_signature(secret, body):
+	if not secret or not _verify_signature(secret, body):
 		frappe.log_error(
 			title="Channel webhook signature mismatch",
 			message=f"channel={channel} phone={phone} conn={conn.name}",
@@ -345,7 +344,8 @@ def _resolve_caller(guest_phone: str | None, property: str | None) -> tuple[str 
 	"""Best-effort: find a guest by E.164 phone, then their active reservation."""
 	if not guest_phone:
 		return None, None
-	guest = frappe.db.get_value("Guest", {"phone": guest_phone}, "name")
+	from kamra import phone as phone_mod
+	guest = frappe.db.get_value("Guest", {"phone": phone_mod.matching(guest_phone, property)}, "name")
 	if not guest:
 		return None, None
 

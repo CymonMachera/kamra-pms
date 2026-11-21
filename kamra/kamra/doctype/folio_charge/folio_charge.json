@@ -8,9 +8,14 @@
  "engine": "InnoDB",
  "field_order": [
   "posting_date",
+  "stay_date",
   "charge_type",
   "transaction_code",
+  "gl_code",
+  "corrects_row",
+  "idempotency_key",
   "description",
+  "allowance_serial",
   "qty",
   "rate",
   "amount",
@@ -19,7 +24,10 @@
   "total",
   "auto_posted",
   "is_alcohol",
-  "reservation"
+  "reservation",
+  "reversal_of",
+  "void_reason",
+  "voided_by"
  ],
  "fields": [
   {
@@ -30,11 +38,18 @@
    "reqd": 1
   },
   {
+   "description": "The night a rate adjustment belongs to (the line itself is dated the business date it was posted).",
+   "fieldname": "stay_date",
+   "fieldtype": "Date",
+   "label": "Night Of",
+   "read_only": 1
+  },
+  {
    "fieldname": "charge_type",
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Charge Type",
-   "options": "Room\nMeal Plan\nFood & Beverage\nMinibar\nLaundry\nSpa\nEarly Check-in\nLate Checkout\nCleaning Fee\nDiscount\nMisc\nAllowance",
+   "options": "Room\nMeal Plan\nFood & Beverage\nMinibar\nLaundry\nSpa\nTaxi\nEarly Check-in\nLate Checkout\nEarly Departure\nCleaning Fee\nExtra Guests\nPet Charge\nRoom Levy\nDiscount\nMisc\nAllowance\nRate Adjustment\nOpening Balance",
    "reqd": 1
   },
   {
@@ -44,10 +59,41 @@
    "options": "Transaction Code"
   },
   {
+   "fieldname": "gl_code",
+   "fieldtype": "Data",
+   "label": "GL Code",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "corrects_row",
+   "fieldtype": "Data",
+   "label": "Corrects Line",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "The line this reversal or repost corrects."
+  },
+  {
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "hidden": 1,
+   "search_index": 1,
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
    "fieldname": "description",
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Description"
+  },
+  {
+   "fieldname": "allowance_serial",
+   "fieldtype": "Data",
+   "label": "Allowance Serial",
+   "read_only": 1,
+   "depends_on": "eval:doc.charge_type=='Allowance'"
   },
   {
    "default": "1",
@@ -102,11 +148,34 @@
    "label": "Is Alcohol"
   },
   {
-   "description": "Which stay this line belongs to \u2014 needed on group master folios that collect charges from many rooms.",
+   "description": "Which stay this line belongs to — needed on group master folios that collect charges from many rooms.",
    "fieldname": "reservation",
    "fieldtype": "Link",
    "label": "Reservation",
    "options": "Reservation",
+   "read_only": 1
+  },
+  {
+   "description": "On a void's reversal line: the line it reverses. Both lines stay on the folio.",
+   "fieldname": "reversal_of",
+   "fieldtype": "Data",
+   "label": "Reverses Line",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "void_reason",
+   "fieldtype": "Small Text",
+   "label": "Void Reason",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "voided_by",
+   "fieldtype": "Link",
+   "label": "Voided By",
+   "no_copy": 1,
+   "options": "User",
    "read_only": 1
   }
  ],
@@ -114,7 +183,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-04 17:55:10.638153",
+ "modified": "2026-11-13 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Kamra",
  "name": "Folio Charge",

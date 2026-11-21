@@ -5,6 +5,7 @@ import { serverError } from "../lib/resource"
 import { Button } from "../components/ui/button"
 import { Badge } from "../components/ui/badge"
 import { moneyLocale } from "../lib/money"
+import { t as translate, useUILanguage } from "../lib/i18n"
 
 const inr = (n: unknown) =>
   Number(n ?? 0).toLocaleString(moneyLocale(), { maximumFractionDigits: 0 })
@@ -22,8 +23,11 @@ type FolioRow = {
 }
 
 export default function FolioHistory() {
+  useUILanguage()
   const [q, setQ] = useState("")
   const [status, setStatus] = useState("")
+  const [fromDate, setFromDate] = useState("") // closed on, "" = any day
+  const [toDate, setToDate] = useState("")
   const [rows, setRows] = useState<FolioRow[]>([])
   const [selected, setSelected] = useState<string[]>([])
   const [err, setErr] = useState<string | null>(null)
@@ -37,13 +41,15 @@ export default function FolioHistory() {
           property: getCurrentProperty(),
           query: q || undefined,
           status: status || undefined,
+          from_date: fromDate || undefined,
+          to_date: (fromDate && toDate) || undefined,
         },
       )
       setRows(out.folios)
     } catch (e) {
       setErr(serverError(e))
     }
-  }, [q, status])
+  }, [q, status, fromDate, toDate])
 
   useEffect(() => {
     void load()
@@ -70,18 +76,16 @@ export default function FolioHistory() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-4 p-4 sm:p-6">
+    <div className="w-full space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">
-            Billing
-          </p>
-          <h1 className="text-2xl font-semibold">Folio History</h1>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">{translate("Billing")}</p>
+          <h1 className="text-2xl font-semibold">{translate("Folio History")}</h1>
         </div>
         <div className="flex flex-wrap gap-2">
           <input
             className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm"
-            placeholder="Search guest / invoice"
+            placeholder={translate("Search guest / invoice")}
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
@@ -90,31 +94,50 @@ export default function FolioHistory() {
             value={status}
             onChange={(e) => setStatus(e.target.value)}
           >
-            <option value="">All</option>
-            <option value="Open">Open</option>
-            <option value="Closed">Closed</option>
+            <option value="">{translate("All")}</option>
+            <option value="Open">{translate("Open")}</option>
+            <option value="Closed">{translate("Closed")}</option>
           </select>
+          <label className="flex items-center gap-1 text-xs text-zinc-500">
+            {translate("Closed from")}
+            <input
+              type="date"
+              className="rounded-lg border border-zinc-300 px-2 py-1.5 text-sm"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+            />
+          </label>
+          <label className="flex items-center gap-1 text-xs text-zinc-500">
+            {translate("To")}
+            <input
+              type="date"
+              className="rounded-lg border border-zinc-300 px-2 py-1.5 text-sm"
+              value={toDate}
+              min={fromDate || undefined}
+              disabled={!fromDate}
+              onChange={(e) => setToDate(e.target.value)}
+            />
+          </label>
           <Button
             variant="outline"
             disabled={!selected.length || busy}
             onClick={() => void batchPrint()}
-          >
-            Batch print ({selected.length})
+          >{translate("Batch print (")}{selected.length})
           </Button>
         </div>
       </div>
-      {err ? <p className="text-sm text-rose-600">{err}</p> : null}
+      {err ? <p className="text-sm text-rose-600">{translate(err)}</p> : null}
       <div className="overflow-x-auto rounded-xl border border-zinc-200 bg-white">
         <table className="w-full text-left text-sm">
           <thead className="border-b text-xs uppercase text-zinc-400">
             <tr>
               <th className="px-3 py-2" />
-              <th className="px-3 py-2">Guest</th>
-              <th className="px-3 py-2">Invoice</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Total</th>
-              <th className="px-3 py-2">Balance</th>
-              <th className="px-3 py-2">Reprints</th>
+              <th className="px-3 py-2">{translate("Guest")}</th>
+              <th className="px-3 py-2">{translate("Invoice")}</th>
+              <th className="px-3 py-2">{translate("Status")}</th>
+              <th className="px-3 py-2">{translate("Total")}</th>
+              <th className="px-3 py-2">{translate("Balance")}</th>
+              <th className="px-3 py-2">{translate("Reprints")}</th>
             </tr>
           </thead>
           <tbody>
@@ -137,11 +160,11 @@ export default function FolioHistory() {
                   <div className="text-xs text-zinc-400">{r.reservation}</div>
                 </td>
                 <td className="px-3 py-2 font-mono text-xs">
-                  {r.invoice_number || "—"}
+                  {r.invoice_number || "-"}
                 </td>
                 <td className="px-3 py-2">
                   <Badge tone={r.status === "Open" ? "green" : "zinc"}>
-                    {r.status}
+                    {translate(r.status)}
                   </Badge>
                 </td>
                 <td className="px-3 py-2 tabular-nums">{inr(r.grand_total)}</td>

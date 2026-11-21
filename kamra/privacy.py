@@ -10,17 +10,21 @@ right thing the default and the lawful thing one click:
   apply_retention    storage limitation (s.8(7)): guests with no stay for
                      Property.guest_retention_months are erased by the daily
                      scheduler. Guests on the blacklist are kept (security is
-                     the stated purpose) until the flag is lifted.
+                     the stated purpose) until                      the flag is lifted.
+  apply_message_retention
+                     storage limitation for conversations: WhatsApp message
+                     text and AI assistant chats older than
+                     Property.message_retention_days are cleared nightly;
+                     who, when and delivery status stay for audit.
 
 What is deliberately kept after erasure: amounts, dates, rooms and invoice
 numbers (GST law needs them), an ID masked to its last 4 digits in the stay
 register, and one audit line saying the erasure happened (without the name).
 """
 
-import json
 
 import frappe
-from frappe.utils import add_months, cint, getdate, nowdate
+from frappe.utils import add_days, add_months, cint, getdate, now_datetime, nowdate
 
 from kamra.authz import require_roles
 
@@ -66,13 +70,14 @@ def erase_guest(guest: str, reason: str = "request") -> dict:
 	counts = {"files": 0, "messages": 0, "occupants": 0}
 
 	# 1. the profile itself, photos included
-	for field in ("id_file", "address_proof_file"):
+	for field in ("id_file", "address_proof_file", "photo"):
 		counts["files"] += _delete_files("Guest", guest, field)
 	counts["files"] += _delete_files("Guest", guest)
 	blank = {"first_name": alias, "last_name": "", "full_name": alias, "phone": "", "email": "",
-	         "id_type": "", "id_number": "", "nationality": "", "address_line": "", "city": "",
-	         "id_file": None, "address_proof_file": None, "date_of_birth": None, "gender": "",
-	         "guest_notes": "Profile erased.", "vip": 0}
+	         "id_type": "", "id_number": "", "id_place_of_issue": "", "id_issue_date": None,
+	         "id_expiry_date": None, "nationality": "", "address_line": "", "city": "",
+	         "id_file": None, "address_proof_file": None, "photo": None, "date_of_birth": None, "gender": "",
+	         "guest_notes": "Profile erased.", "vip": 0, "marketing_consent": 0}
 	frappe.db.set_value("Guest", guest, {k: v for k, v in blank.items() if g.meta.has_field(k)},
 	                    update_modified=False)
 
@@ -93,6 +98,9 @@ def erase_guest(guest: str, reason: str = "request") -> dict:
 			if o.get("id_file"):
 				counts["files"] += _delete_files("Reservation", r, url=o.id_file)
 				oc["id_file"] = None
+			if o.get("photo"):
+				counts["files"] += _delete_files("Reservation", r, url=o.photo)
+				oc["photo"] = None
 			if o.full_name in secrets:
 				oc["full_name"] = alias
 			frappe.db.set_value("Stay Occupant", o.name, oc, update_modified=False)
@@ -125,7 +133,7 @@ def erase_guest(guest: str, reason: str = "request") -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles()
+@require_roles(scope={"guest": "Guest"})
 def export_guest_data(guest: str) -> dict:
 	"""Right to access: everything Kamra holds about one guest, readable."""
 	g = frappe.get_doc("Guest", guest)
@@ -177,3 +185,78 @@ def apply_retention(limit: int = 500) -> dict:
 			erased += 1
 			frappe.db.commit()  # nosemgrep: frappe-manual-commit -- scheduler: one guest's erasure must not roll back another's
 	return {"erased": erased}
+
+
+CLEARED_CHAT_TITLE = "Chat cleared (retention period ended)"
+
+
+def apply_message_retention() -> dict:
+	"""Daily: clear WhatsApp message text and AI assistant chats older than
+	their property's message_retention_days. Rows stay, so delivery status,
+	direction, template and timestamps remain for audit. A chat with no
+	property follows the shortest period set on any property."""
+	days = {p.name: cint(p.message_retention_days)
+	        for p in frappe.get_all("Property", fields=["name", "message_retention_days"])}
+	set_days = [d for d in days.values() if d > 0]
+	if not set_days:
+		return {"messages": 0, "chats": 0}
+	now = now_datetime()
+	messages = chats = 0
+	for prop, d in days.items():
+		if d <= 0:
+			continue
+		cutoff = add_days(now, -d)
+		names = frappe.get_all("WhatsApp Message", pluck="name", filters={
+			"property": prop, "creation": ("<", cutoff), "content": ("not in", ("", "[erased]"))})
+		for name in names:
+			frappe.db.set_value("WhatsApp Message", name, "content", "", update_modified=False)
+		messages += len(names)
+		chats += _clear_chats({"property": prop, "modified": ("<", cutoff)})
+	chats += _clear_chats({"property": ("is", "not set"),
+	                       "modified": ("<", add_days(now, -min(set_days)))})
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit -- scheduler: persist the nightly clean-up
+	return {"messages": messages, "chats": chats}
+
+
+def _clear_chats(filters: dict) -> int:
+	names = frappe.get_all("Copilot Conversation", pluck="name",
+	                       filters={**filters, "messages": ("!=", "[]")})
+	for name in names:
+		# modified is the last activity; keep it so the chat is not
+		# picked up again as fresh
+		frappe.db.set_value("Copilot Conversation", name,
+		                    {"messages": "[]", "title": CLEARED_CHAT_TITLE}, update_modified=False)
+	return len(names)
+
+
+# Marketing consent (DPDP s.6): promotional WhatsApp goes only to guests who
+# opted in, and withdrawing is as easy as giving it.
+CONSENT_CHANNEL = {"Booking Page": "API", "Desk": "Desk", "WhatsApp Keyword": "WhatsApp"}
+
+
+def set_marketing_consent(guest: str, consent, source: str, property: str | None = None) -> bool:
+	"""The only writer of Guest.marketing_consent. Records when and how, and
+	logs the change. Returns False when nothing changed."""
+	if source not in CONSENT_CHANNEL:
+		frappe.throw(f"Unknown consent source {source}.")
+	consent = 1 if cint(consent) else 0
+	if cint(frappe.db.get_value("Guest", guest, "marketing_consent")) == consent:
+		return False
+	frappe.db.set_value("Guest", guest, {"marketing_consent": consent,
+	                                     "marketing_consent_date": now_datetime(),
+	                                     "marketing_consent_source": source})
+	from kamra.savings import log_action
+	verb = "granted" if consent else "withdrawn"
+	log_action(f"marketing_consent_{verb}", "Guest", guest, property=property,
+	           channel=CONSENT_CHANNEL[source],
+	           rationale=f"Marketing consent {verb} ({source})")
+	return True
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Front Desk", "Kamra Agent", scope={"guest": "Guest"})
+def update_marketing_consent(guest: str, consent) -> dict:
+	"""Desk toggle in the guest profile: record or withdraw consent."""
+	set_marketing_consent(guest, consent, "Desk")
+	return frappe.db.get_value("Guest", guest, ["marketing_consent", "marketing_consent_date",
+	                                            "marketing_consent_source"], as_dict=True)

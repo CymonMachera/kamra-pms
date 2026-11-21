@@ -21,7 +21,7 @@ why it is there, so each is spelled out where it lives:
    have; go count and tell me what you DO."
 
 Permissions: consume_for_lines() runs under a captain's session, which cannot
-write Ingredient Stock or Stock Ledger Entry by design - only Finance can move
+write Ingredient Stock or Ingredient Ledger Entry by design - only Finance can move
 stock deliberately. The writes in _apply_move() therefore use
 ignore_permissions / db.set_value. That is intentional, not an oversight: the
 authorization for consumption is the POS_ROLES gate on fire_kot, not doctype
@@ -34,14 +34,16 @@ import frappe
 from frappe import _
 
 from kamra.authz import require_roles
+from kamra.localization import money_text
 
 # Who may look at stock, and who may move it. Chefs never appear here: they
 # consume implicitly through fire_kot (already gated on POS_ROLES), because
 # consumption is a byproduct of service, not an inventory action. Receiving
 # and counting are money - a goods-in is an asset movement, a stock take is a
-# P&L event - so they sit with Finance (require_roles widens that to admins).
-INVENTORY_READ = ("Front Desk", "Finance", "Kamra Agent", "Hotel Admin")
-INVENTORY_WRITE = ("Finance",)
+# P&L event - so they sit with Finance and the F&B Manager who runs the
+# kitchen (require_roles widens that to admins).
+INVENTORY_READ = ("Front Desk", "Finance", "F&B Manager", "Kamra Agent", "Hotel Admin")
+INVENTORY_WRITE = ("Finance", "F&B Manager")
 
 STATUS_OK, STATUS_LOW, STATUS_OUT, STATUS_NEGATIVE = "OK", "LOW", "OUT", "NEGATIVE"
 
@@ -99,7 +101,8 @@ def _apply_move(property: str, outlet: str, ingredient: str,
                 qty_change: float, reason: str, *, ref_dt: str | None = None,
                 ref_dn: str | None = None, note: str | None = None,
                 supplier: str | None = None, invoice_no: str | None = None,
-                batch_id: str | None = None, set_counted: bool = False) -> float:
+                batch_id: str | None = None, set_counted: bool = False,
+                set_qty: float | None = None) -> float:
 	"""THE only writer of qty_on_hand. One move = one locked row + one ledger
 	entry, in one transaction. Never blocks: a move that takes the balance
 	negative still lands, because a stale count must not stop service.
@@ -114,7 +117,13 @@ def _apply_move(property: str, outlet: str, ingredient: str,
 	name = _stock_row(property, outlet, ingredient, for_update=True)
 	current = float(frappe.db.get_value("Ingredient Stock", name, "qty_on_hand",
 	                                    for_update=True) or 0)
-	after = current + float(qty_change)
+	# A count reports what is on the shelf. Applying a delta taken before
+	# the lock would miss a sale that landed while this count waited.
+	if set_qty is not None:
+		after = float(set_qty)
+		qty_change = after - current
+	else:
+		after = current + float(qty_change)
 	cost = frappe.db.get_value("Ingredient", ingredient, "cost_per_unit")
 
 	frappe.db.set_value("Ingredient Stock", name, "qty_on_hand", after,
@@ -126,7 +135,7 @@ def _apply_move(property: str, outlet: str, ingredient: str,
 		}, update_modified=False)
 
 	frappe.get_doc({
-		"doctype": "Stock Ledger Entry", "property": property, "outlet": outlet,
+		"doctype": "Ingredient Ledger Entry", "property": property, "outlet": outlet,
 		"ingredient": ingredient, "qty_change": float(qty_change),
 		"balance_after": after, "reason": reason,
 		"reference_doctype": ref_dt, "reference_name": ref_dn, "note": note,
@@ -304,7 +313,7 @@ def recipe_overview(property: str):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles("Finance", "Hotel Admin")
+@require_roles("Finance", "F&B Manager", "Hotel Admin")
 def save_recipe(menu_item: str, rows):
 	"""Replace a dish's recipe wholesale. An empty list is valid and means
 	"this dish never touches inventory" - the optional in the requirement."""
@@ -329,10 +338,11 @@ def save_recipe(menu_item: str, rows):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*INVENTORY_WRITE)
+@require_roles(*INVENTORY_WRITE, scope={"name": "Ingredient"})
 def save_ingredient(property: str, ingredient_name: str, uom: str,
                     category: str | None = None, cost_per_unit: float = 0,
-                    is_active: int = 1, name: str | None = None):
+                    gst_rate: float | None = None, is_active: int = 1,
+                    name: str | None = None):
 	"""Create or update one ingredient."""
 	if not (ingredient_name or "").strip():
 		frappe.throw(_("An ingredient needs a name."))
@@ -342,12 +352,14 @@ def save_ingredient(property: str, ingredient_name: str, uom: str,
 		"uom": uom, "category": (category or "").strip() or None,
 		"cost_per_unit": float(cost_per_unit or 0), "is_active": int(is_active or 0),
 	})
+	if gst_rate is not None:
+		doc.gst_rate = float(gst_rate)
 	doc.save()
 	return {"ok": True, "name": doc.name}
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*INVENTORY_WRITE)
+@require_roles(*INVENTORY_WRITE, scope={"name": "Ingredient"})
 def delete_ingredient(name: str):
 	"""Refuse if it is on a recipe or has history - deleting it would orphan a
 	recipe or punch a hole in the ledger. Deactivate instead."""
@@ -355,7 +367,7 @@ def delete_ingredient(name: str):
 	if used:
 		frappe.throw(_("{0} dish(es) use this ingredient. Deactivate it instead.")
 		             .format(used))
-	if frappe.db.count("Stock Ledger Entry", {"ingredient": name}):
+	if frappe.db.count("Ingredient Ledger Entry", {"ingredient": name}):
 		frappe.throw(_("This ingredient has stock history. Deactivate it instead."))
 	frappe.delete_doc("Ingredient", name)
 	return {"ok": True}
@@ -422,16 +434,16 @@ def adjust_stock(property: str, outlet: str, rows, note: str):
 	for r in rows:
 		ing = r["ingredient"]
 		counted = float(r.get("counted_qty") or 0)
-		name = _stock_row(property, outlet, ing)
-		current = float(frappe.db.get_value("Ingredient Stock", name, "qty_on_hand") or 0)
-		delta = counted - current
-		if abs(delta) < 1e-9:
+		name = _stock_row(property, outlet, ing, for_update=True)
+		current = float(frappe.db.get_value("Ingredient Stock", name, "qty_on_hand",
+		                                    for_update=True) or 0)
+		if abs(counted - current) < 1e-9:
 			continue  # counted exactly what we thought: nothing to record
-		after = _apply_move(property, outlet, ing, delta, "Count",
+		after = _apply_move(property, outlet, ing, 0, "Count",
 		                    note=note.strip()[:500], batch_id=batch,
-		                    set_counted=True)
+		                    set_counted=True, set_qty=counted)
 		out.append({"ingredient": ing, "was": current, "now": after,
-		            "variance": delta})
+		            "variance": after - current})
 
 	if out:
 		from kamra.savings import log_action
@@ -440,7 +452,7 @@ def adjust_stock(property: str, outlet: str, rows, note: str):
 		                                        "cost_per_unit") or 0)
 		            for r in out)
 		log_action("stock_count", "POS Outlet", outlet, property,
-		           rationale=f"{len(out)} variance(s), ~₹{value:,.0f} adjusted - "
+		           rationale=f"{len(out)} variance(s), ~{money_text(property, round(value))} adjusted - "
 		                     f"{note.strip()[:80]}",
 		           channel="API")
 	return {"ok": True, "batch_id": batch, "adjusted": out}
@@ -467,7 +479,7 @@ def record_wastage(property: str, outlet: str, ingredient: str, qty: float,
 	from kamra.savings import log_action
 	cost = float(frappe.db.get_value("Ingredient", ingredient, "cost_per_unit") or 0)
 	log_action("stock_wastage", "Ingredient", ingredient, property,
-	           rationale=f"{qty} wasted (~₹{qty * cost:,.0f}) - "
+	           rationale=f"{qty} wasted (~{money_text(property, round(qty * cost))}) - "
 	                     f"{reason_note.strip()[:80]}",
 	           channel="API")
 	return {"ok": True, "qty_on_hand": after}
@@ -508,7 +520,7 @@ def ingredient_ledger(property: str, outlet: str, ingredient: str,
 	"""Where did my paneer go? Newest first, each row carrying the balance it
 	produced, so the history explains the number on the shelf."""
 	rows = frappe.get_all(
-		"Stock Ledger Entry",
+		"Ingredient Ledger Entry",
 		filters={"property": property, "outlet": outlet, "ingredient": ingredient},
 		fields=["name", "creation", "qty_change", "balance_after", "reason",
 		        "reference_doctype", "reference_name", "note", "supplier",
@@ -608,7 +620,7 @@ def wastage_report(property: str, outlet: str | None = None, days: int = 30):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles("Finance", "Hotel Admin")
+@require_roles("Finance", "F&B Manager", "Hotel Admin")
 def set_menu_availability(menu_item: str, available: int):
 	"""86 a dish, or put it back. This is the ONLY thing that ever pulls an
 	item off the menu for stock reasons, and a human has to press it.

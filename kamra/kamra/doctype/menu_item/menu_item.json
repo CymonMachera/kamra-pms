@@ -99,25 +99,23 @@
   },
   {
    "fieldname": "course",
-   "fieldtype": "Select",
+   "fieldtype": "Data",
    "label": "Course",
-   "options": "Starter\nMain\nDessert\nDrink",
    "default": "Main",
-   "description": "When it is served. The kitchen holds later courses until the table is ready for them."
+   "description": "When it is served (Starter, Main, …). The list is Settings → F&B → Courses. The kitchen holds later courses until the table is ready for them."
   },
   {
    "fieldname": "allergens",
    "fieldtype": "Data",
    "label": "Allergens",
-   "description": "What this dish contains, comma separated (e.g. Nuts, Dairy). Matched against the guest's declared allergy to alarm the line."
+   "description": "What this dish contains, comma separated (e.g. Egg, Nuts, Dairy). Tags come from Settings → F&B → Allergens & dietary tags. Matched against the guest's declared allergy to alarm the line."
   },
   {
    "fieldname": "prep_station",
-   "fieldtype": "Select",
+   "fieldtype": "Data",
    "label": "Prep Station",
-   "options": "Kitchen\nTandoor\nGrill\nFryer\nBar",
    "default": "Kitchen",
-   "description": "Which KOT this item prints to."
+   "description": "Which KOT this item prints to. The list is Settings → F&B → Prep stations."
   },
   {
    "fieldname": "section_recipe",
@@ -135,7 +133,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-07-04 21:48:59.749911",
+ "modified": "2026-10-30 19:00:00.000000",
  "modified_by": "Administrator",
  "module": "Kamra",
  "name": "Menu Item",
@@ -187,6 +185,15 @@
    "read": 1,
    "report": 1,
    "role": "Kamra Agent"
+  },
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "write": 1,
+   "role": "F&B Manager"
   }
  ],
  "row_format": "Dynamic",

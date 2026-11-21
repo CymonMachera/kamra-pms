@@ -2,12 +2,14 @@ import {
   useCallback,
   useEffect,
   useState,
+  Suspense,
   type ComponentType,
   type ReactNode,
 } from "react"
+import { useSearchParams } from "react-router-dom"
 import { Columns3, Download, Plus, Search, Trash2 } from "lucide-react"
 import { Sheet } from "./ui/sheet"
-import { getCurrentProperty } from "../lib/api"
+import { call, getCurrentProperty } from "../lib/api"
 import {
   createResource,
   deleteResource,
@@ -21,25 +23,118 @@ import { Badge } from "./ui/badge"
 import { Button } from "./ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card"
 import ImageField from "./ImageField"
-import { moneyLocale } from "../lib/money"
-import { useT, t as translate } from "../lib/i18n"
+import { fmtAmount } from "../lib/money"
+import { useT, t as translate, useUILanguage } from "../lib/i18n"
+import { useAuth } from "../lib/auth"
+import { downloadCsv } from "../lib/csv"
+
+const BACKDATE_ROLES = ["Finance", "Hotel Admin", "System Manager", "Administrator"]
+
+function isoToday() {
+  const d = new Date()
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, "0")
+  const day = String(d.getDate()).padStart(2, "0")
+  return `${y}-${m}-${day}`
+}
+
+
+/** Keys from kamra.settings.menu_masters - property-editable master lists. */
+export type MenuMasterKey =
+  | "allergens"
+  | "prep_stations"
+  | "courses"
+  | "categories"
+
+/** Options loaded from a doctype: the value stored, the label shown. */
+export interface OptionSource {
+  linkDoctype: string
+  /** field stored/filtered on (default: the record name) */
+  valueField?: string
+  /** field shown (default: the value) */
+  labelField?: string
+  propertyScoped?: boolean
+  orderBy?: string
+}
+
+/** The Floor master as an option source: floor names in the master's order. */
+export const floorSource: OptionSource = {
+  linkDoctype: "Floor",
+  valueField: "floor_name",
+  propertyScoped: true,
+  orderBy: "sort_order asc, floor_name asc",
+}
+
+export type FilterSpec = {
+  field: string
+  label: string
+  /** static options */
+  options?: string[]
+} & Partial<Omit<OptionSource, "linkDoctype">> & { linkDoctype?: string; optionsFrom?: "Floor" }
+
+type Opt = { value: string; label: string }
+
+function sourceOf(f: FilterSpec): OptionSource | null {
+  if (f.optionsFrom === "Floor") return floorSource
+  return f.linkDoctype ? (f as OptionSource) : null
+}
+
+function loadOptions(src: OptionSource): Promise<Opt[]> {
+  const vf = src.valueField ?? "name"
+  const lf = src.labelField ?? vf
+  return listResource(src.linkDoctype, {
+    fields: Array.from(new Set([vf, lf])),
+    filters: src.propertyScoped ? [["property", "=", getCurrentProperty()]] : undefined,
+    limit: 500,
+    orderBy: src.orderBy ?? `${lf} asc`,
+  }).then((r) =>
+    r.map((x) => ({ value: String(x[vf] ?? ""), label: String(x[lf] ?? x[vf] ?? "") })),
+  )
+}
 
 export interface FieldSpec {
   field: string
   label: string
-  type: "data" | "int" | "float" | "currency" | "select" | "check" | "date" | "link" | "readonly" | "image"
-  options?: string[] // for select
+  type:
+    | "data"
+    | "int"
+    | "float"
+    | "currency"
+    | "select"
+    | "check"
+    | "date"
+    | "link"
+    | "readonly"
+    | "image"
+    | "tags"
+  options?: string[] // for select / tags (static fallback)
+  /** Load options from Settings → F&B → Menu master lists */
+  optionsFrom?: MenuMasterKey
+  /** select options loaded from a doctype (e.g. the property's floors) */
+  source?: OptionSource
+  /** with `source`: offer "Add a floor" to type a value not in the list yet */
+  allowNew?: string
   linkDoctype?: string // for link
+  /** link options only from the current property (the target has a `property` field) */
+  linkPropertyScoped?: boolean
   required?: boolean
   hint?: string // for image: recommended size/format
   dependsOn?: (draft: Record<string, unknown>) => boolean
+  /** Block dates before today unless the user may backdate (Finance / Hotel Admin). */
+  notPast?: boolean
 }
 
 export interface ScreenConfig {
   doctype: string
   title: string
   description?: string
-  columns: { field: string; label: string; badge?: boolean }[]
+  columns: {
+    field: string
+    label: string
+    badge?: boolean
+    /** Map a Check field (0/1) to Active / Disabled badges. */
+    statusCheck?: boolean
+  }[]
   form: FieldSpec[]
   propertyScoped?: boolean
   allowCreate?: boolean
@@ -48,7 +143,7 @@ export interface ScreenConfig {
   /** Fields searched (LIKE) by the search box. Adds a search input when set. */
   searchFields?: string[]
   /** Dropdown filters shown in the toolbar (e.g. status). */
-  filters?: { field: string; label: string; options: string[] }[]
+  filters?: FilterSpec[]
   /** Rows per page (adds pagination when set). */
   pageSize?: number
   /** Date-range filter on this date field (adds From/To pickers). */
@@ -69,17 +164,155 @@ const inputCls =
   "focus:outline-2 focus:outline-offset-1 focus:outline-brand-600 " +
   "disabled:bg-zinc-50 disabled:text-zinc-400"
 
+function parseTags(value: unknown): string[] {
+  if (Array.isArray(value))
+    return value.map((x) => String(x).trim()).filter(Boolean)
+  return String(value ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+}
+
+function TagsInput(props: {
+  value: unknown
+  onChange: (v: string) => void
+  options: string[]
+  t: (s: string) => string
+}) {
+  const selected = parseTags(props.value)
+  const available = props.options.filter(
+    (o) => !selected.some((s) => s.toLowerCase() === o.toLowerCase()),
+  )
+  const toggle = (tag: string) => {
+    const next = selected.some((s) => s.toLowerCase() === tag.toLowerCase())
+      ? selected.filter((s) => s.toLowerCase() !== tag.toLowerCase())
+      : [...selected, tag]
+    props.onChange(next.join(", "))
+  }
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5">
+        {selected.length === 0 && (
+          <span className="text-xs text-zinc-400">{props.t("None selected")}</span>
+        )}
+        {selected.map((tag) => (
+          <button
+            key={tag}
+            type="button"
+            onClick={() => toggle(tag)}
+            className="inline-flex items-center gap-1 rounded-full border border-brand-200 bg-brand-50 px-2.5 py-0.5 text-xs font-medium text-brand-800 hover:bg-brand-100"
+          >
+            {props.t(tag)}
+            <span aria-hidden className="text-brand-500">×</span>
+          </button>
+        ))}
+      </div>
+      {available.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {available.map((tag) => (
+            <button
+              key={tag}
+              type="button"
+              onClick={() => toggle(tag)}
+              className="rounded-full border border-zinc-200 bg-white px-2.5 py-0.5 text-xs text-zinc-600 hover:border-zinc-300 hover:bg-zinc-50"
+            >
+              + {props.t(tag)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** A select whose options come from a doctype; allowNew adds a typed value. */
+function SourceSelect(props: {
+  spec: FieldSpec
+  value: unknown
+  onChange: (v: unknown) => void
+  t: (s: string) => string
+}) {
+  const { spec, value, onChange, t } = props
+  const [opts, setOpts] = useState<Opt[]>([])
+  const [adding, setAdding] = useState(false)
+  useEffect(() => {
+    loadOptions(spec.source!).then(setOpts).catch(() => setOpts([]))
+  }, [spec.source])
+  const cur = String(value ?? "")
+  if (adding)
+    return (
+      <div className="flex gap-2">
+        <input
+          autoFocus
+          className={inputCls}
+          value={cur}
+          placeholder={t(spec.allowNew ?? "")}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <button
+          type="button"
+          className="text-xs text-zinc-500 hover:text-zinc-700"
+          onClick={() => setAdding(false)}
+        >
+          {t("Choose from list")}
+        </button>
+      </div>
+    )
+  return (
+    <select
+      className={inputCls}
+      value={cur}
+      onChange={(e) => {
+        if (e.target.value === NEW) {
+          onChange("")
+          setAdding(true)
+        } else onChange(e.target.value)
+      }}
+    >
+      <option value="">-</option>
+      {cur && !opts.some((o) => o.value === cur) && <option value={cur}>{cur}</option>}
+      {opts.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label}
+        </option>
+      ))}
+      {spec.allowNew && <option value={NEW}>{t(spec.allowNew)}</option>}
+    </select>
+  )
+}
+const NEW = "__new__"
+
 function FieldInput(props: {
   spec: FieldSpec
   value: unknown
   onChange: (v: unknown) => void
   linkOptions: Record<string, string[]>
+  masterOptions: Partial<Record<MenuMasterKey, string[]>>
   /** Translate display labels; API values stay English. */
   t: (s: string) => string
+  canBackdate?: boolean
 }) {
-  const { spec, value, onChange, t } = props
+  useUILanguage()
+  const { spec, value, onChange, t, canBackdate } = props
+  const masterOpts =
+    (spec.optionsFrom && props.masterOptions[spec.optionsFrom]) ||
+    spec.options ||
+    []
   switch (spec.type) {
+    case "tags":
+      return (
+        <TagsInput
+          value={value}
+          onChange={(v) => onChange(v)}
+          options={masterOpts}
+          t={t}
+        />
+      )
     case "select":
+      if (spec.source)
+        return (
+          <SourceSelect spec={spec} value={value} onChange={onChange} t={t} />
+        )
       return (
         <select
           className={inputCls}
@@ -87,7 +320,7 @@ function FieldInput(props: {
           onChange={(e) => onChange(e.target.value)}
         >
           <option value="">-</option>
-          {spec.options?.map((o) => (
+          {masterOpts.map((o) => (
             <option key={o} value={o}>
               {t(o)}
             </option>
@@ -124,6 +357,7 @@ function FieldInput(props: {
           type="date"
           className={inputCls}
           value={String(value ?? "")}
+          min={spec.notPast && !canBackdate ? isoToday() : undefined}
           onChange={(e) => onChange(e.target.value)}
         />
       )
@@ -152,20 +386,51 @@ function FieldInput(props: {
           onChange={(url) => onChange(url)}
         />
       )
-    default:
+    default: {
+      const optionLabels = masterOpts.map((option) => ({ value: option, label: t(option) }))
+      const labelCounts = new Map<string, number>()
+      for (const { label } of optionLabels) {
+        labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1)
+      }
+      // Keep distinct original values selectable when their translations coincide.
+      const suggestions = optionLabels.map((option) => ({
+        ...option,
+        label: (labelCounts.get(option.label) ?? 0) > 1 && option.label !== option.value
+          ? `${option.label} (${option.value})`
+          : option.label,
+      }))
+      const rawValue = String(value ?? "")
+      const selected = suggestions.find((option) => option.value === rawValue)
       return (
-        <input
-          className={inputCls}
-          value={String(value ?? "")}
-          onChange={(e) => onChange(e.target.value)}
-        />
+        <>
+          <input
+            className={inputCls}
+            list={spec.optionsFrom ? `masters-${spec.field}` : undefined}
+            value={selected?.label ?? rawValue}
+            onChange={(e) => {
+              const entered = e.target.value
+              const suggestion = suggestions.find((option) => option.label === entered)
+              // Store the master value; free text remains available for new categories.
+              onChange(suggestion?.value ?? entered)
+            }}
+          />
+          {spec.optionsFrom && suggestions.length > 0 && (
+            <datalist id={`masters-${spec.field}`}>
+              {suggestions.map((option) => (
+                <option key={option.value} value={option.label} />
+              ))}
+            </datalist>
+          )}
+        </>
       )
+    }
   }
 }
 
 const BADGE_TONES: Record<string, "green" | "sky" | "amber" | "rose" | "zinc"> = {
   Confirmed: "green", "Checked In": "sky", "Checked Out": "zinc",
   Cancelled: "rose", "No Show": "rose", Waitlist: "amber",
+  Requested: "amber", Held: "amber", "Pending Payment": "amber",
   Open: "amber", Closed: "zinc", Enquiry: "amber", Completed: "zinc",
   Clean: "green", Dirty: "amber", Inspected: "sky", "Out of Order": "rose",
   "In Progress": "sky", Done: "green",
@@ -173,7 +438,7 @@ const BADGE_TONES: Record<string, "green" | "sky" | "amber" | "rose" | "zinc"> =
 
 const cellValue = (v: unknown, t: (s: string) => string = translate) =>
   typeof v === "number"
-    ? v.toLocaleString(moneyLocale(), { maximumFractionDigits: 2 })
+    ? fmtAmount(v)
     : v == null || v === ""
       ? "-"
       : typeof v === "string"
@@ -188,13 +453,18 @@ export function ResourceScreen({
   /** Extra control rendered in the header next to New (e.g. a bulk import). */
   headerAction?: ReactNode
 }) {
-  const { t } = useT()
+  const { t, lang } = useT()
+  const { roles } = useAuth()
+  const canBackdate = roles.some((r) => BACKDATE_ROLES.includes(r))
   const [rows, setRows] = useState<Row[]>([])
   const [editing, setEditing] = useState<Row | "new" | null>(null)
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [linkOptions, setLinkOptions] = useState<Record<string, string[]>>({})
+  const [masterOptions, setMasterOptions] = useState<
+    Partial<Record<MenuMasterKey, string[]>>
+  >({})
   const [search, setSearch] = useState("")
   // Frappe-style list settings: choose which columns this table shows,
   // remembered per user per doctype.
@@ -219,6 +489,17 @@ export function ResourceScreen({
   const visibleCols = config.columns.filter((c) => !hiddenCols.has(c.field))
   const [debounced, setDebounced] = useState("")
   const [filterVals, setFilterVals] = useState<Record<string, string>>({})
+  const [filterOpts, setFilterOpts] = useState<Record<string, Opt[]>>({})
+  useEffect(() => {
+    for (const f of config.filters ?? []) {
+      const src = sourceOf(f)
+      if (src)
+        loadOptions(src)
+          .then((o) => setFilterOpts((p) => ({ ...p, [f.field]: o })))
+          .catch(() => {})
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.doctype])
   const [dateFrom, setDateFrom] = useState("")
   const [dateTo, setDateTo] = useState("")
   const [page, setPage] = useState(0)
@@ -270,6 +551,22 @@ export function ResourceScreen({
 
   useEffect(load, [load])
 
+  // ?open=<name> - a link from another record opens that row's panel
+  const [searchParams, setSearchParams] = useSearchParams()
+  const openParam = searchParams.get("open")
+  useEffect(() => {
+    if (!openParam) return
+    openEdit({ name: openParam })
+    setSearchParams(
+      (p) => {
+        p.delete("open")
+        return p
+      },
+      { replace: true },
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openParam])
+
   async function exportCsv() {
     const filters: (string | number)[][] = []
     if (config.propertyScoped)
@@ -292,29 +589,22 @@ export function ResourceScreen({
       limit: 2000,
     })
     const cols = visibleCols
-    const esc = (v: unknown) => {
-      const t = String(v ?? "")
-      return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t
-    }
-    const csv = [
-      cols.map((c) => esc(c.label)).join(","),
-      ...all.map((r) => cols.map((c) => esc(r[c.field])).join(",")),
-    ].join("\n")
-    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })
-    const a = document.createElement("a")
-    a.href = URL.createObjectURL(blob)
-    a.download = `${config.doctype.toLowerCase().replace(/ /g, "-")}-${new Date().toISOString().slice(0, 10)}.csv`
-    a.click()
-    URL.revokeObjectURL(a.href)
+    downloadCsv(
+      `${config.doctype.toLowerCase().replace(/ /g, "-")}-${new Date().toISOString().slice(0, 10)}`,
+      cols.map((c) => c.label),
+      all.map((r) => cols.map((c) => r[c.field] as string | number | null)),
+    )
   }
 
-  // load link options once per screen
+  // load link options and menu master lists once per screen
   useEffect(() => {
     const links = config.form.filter((f) => f.type === "link" && f.linkDoctype)
     links.forEach((f) => {
       listResource(f.linkDoctype!, {
         fields: ["name"],
-        filters: undefined,
+        filters: f.linkPropertyScoped
+          ? [["property", "=", getCurrentProperty()]]
+          : undefined,
         limit: 100,
         orderBy: "name asc",
       }).then((r) =>
@@ -324,6 +614,13 @@ export function ResourceScreen({
         })),
       )
     })
+    if (config.form.some((f) => f.optionsFrom)) {
+      call<Record<MenuMasterKey, string[]>>("kamra.settings.menu_masters", {
+        property: getCurrentProperty(),
+      })
+        .then(setMasterOptions)
+        .catch(() => setMasterOptions({}))
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.doctype])
 
@@ -331,10 +628,15 @@ export function ResourceScreen({
     setEditing(row)
     setError(null)
     if (row === "new") {
-      setDraft({})
+      // ponytail: transaction dates default to today when notPast is set
+      const defaults: Record<string, unknown> = {}
+      for (const spec of config.form) {
+        if (spec.type === "date" && spec.notPast) defaults[spec.field] = isoToday()
+      }
+      setDraft(defaults)
       return
     }
-    // List rows only carry column fields — fetch the full document so
+    // List rows only carry column fields - fetch the full document so
     // form extras (location, slugs, etc.) aren't blank and can't wipe DB values.
     setDraft({ ...row })
     frappeFetch<{ data: Row }>(
@@ -347,7 +649,7 @@ export function ResourceScreen({
   async function save() {
     setBusy(true)
     try {
-      // Only persist form fields — never the raw list-row or full-doc dump.
+      // Only persist form fields - never the raw list-row or full-doc dump.
       const payload: Record<string, unknown> = {}
       for (const f of config.form) {
         if (f.type === "readonly") continue
@@ -406,7 +708,7 @@ export function ResourceScreen({
       <CardContent>
         {error && !editing && (
           <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-            {error}
+            {translate(error)}
           </div>
         )}
         <div className="mb-4 flex flex-wrap items-center gap-2">
@@ -431,11 +733,17 @@ export function ResourceScreen({
                 className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm focus:outline-2 focus:outline-offset-1 focus:outline-brand-600"
               >
                 <option value="">{t("{label}: all", { label: t(f.label) })}</option>
-                {f.options.map((o) => (
-                  <option key={o} value={o}>
-                    {t(o)}
-                  </option>
-                ))}
+                {f.options
+                  ? f.options.map((o) => (
+                      <option key={o} value={o}>
+                        {t(o)}
+                      </option>
+                    ))
+                  : (filterOpts[f.field] ?? []).map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
               </select>
             ))}
             {config.dateFilter && (
@@ -443,7 +751,7 @@ export function ResourceScreen({
                 <span className="text-xs">{t(config.dateFilter.label)}</span>
                 <input
                   type="date"
-                  aria-label={`${t(config.dateFilter.label)} ${t("from")}`}
+                  aria-label={(`${t(config.dateFilter.label)} ${t("from")}`)}
                   className="rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm"
                   value={dateFrom}
                   onChange={(e) => setDateFrom(e.target.value)}
@@ -451,7 +759,7 @@ export function ResourceScreen({
                 <span className="text-xs">{t("to")}</span>
                 <input
                   type="date"
-                  aria-label={`${t(config.dateFilter.label)} ${t("to")}`}
+                  aria-label={(`${t(config.dateFilter.label)} ${t("to")}`)}
                   className="rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm"
                   value={dateTo}
                   onChange={(e) => setDateTo(e.target.value)}
@@ -515,11 +823,16 @@ export function ResourceScreen({
             </div>
           </div>
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full table-fixed text-sm">
             <thead>
               <tr className="border-b border-zinc-200 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">
-                {visibleCols.map((c) => (
-                  <th key={c.field} className="py-2 pr-4">
+                {visibleCols.map((c, i) => (
+                  <th
+                    key={c.field}
+                    className={
+                      "py-2 pr-4" + (i === 0 ? " w-[22%]" : "")
+                    }
+                  >
                     {t(c.label)}
                   </th>
                 ))}
@@ -536,13 +849,17 @@ export function ResourceScreen({
                     <td
                       key={c.field}
                       className={
-                        "py-2.5 pr-4" +
+                        "truncate py-2.5 pr-4" +
                         (typeof row[c.field] === "number"
                           ? " text-right tabular-nums"
                           : "")
                       }
                     >
-                      {c.badge && row[c.field] ? (
+                      {c.statusCheck ? (
+                        <Badge tone={row[c.field] ? "zinc" : "green"}>
+                          {t(row[c.field] ? "Disabled" : "Active")}
+                        </Badge>
+                      ) : c.badge && row[c.field] ? (
                         <Badge
                           tone={BADGE_TONES[String(row[c.field])] ?? "zinc"}
                         >
@@ -598,12 +915,12 @@ export function ResourceScreen({
           wide
           title={
             editing === "new"
-              ? t("New {thing}", {
+              ? (lang !== "en") ? t("New record in {section}", { section: t(config.title) }) : t("New {thing}", {
                   thing: t(config.title.replace(/s$/, "")),
                 })
               : String(editing.name)
           }
-          description={useDetail ? undefined : config.description ? t(config.description) : undefined}
+          description={(useDetail ? undefined : config.description ? t(config.description) : undefined)}
           onClose={() => setEditing(null)}
           footer={
             useDetail ? undefined : (
@@ -634,11 +951,13 @@ export function ResourceScreen({
           }
         >
           {useDetail && config.detailPanel ? (
-            <config.detailPanel
-              row={editing}
-              reload={load}
-              onClose={() => setEditing(null)}
-            />
+            <Suspense fallback={<p className="text-sm text-zinc-400">{t("Loading…")}</p>}>
+              <config.detailPanel
+                row={editing}
+                reload={load}
+                onClose={() => setEditing(null)}
+              />
+            </Suspense>
           ) : (
             <div className="space-y-4">
               <div className="grid gap-x-5 gap-y-4 sm:grid-cols-2">
@@ -647,7 +966,9 @@ export function ResourceScreen({
                     key={spec.field}
                     className={
                       "block" +
-                      (spec.type === "check" ? " sm:col-span-2" : "")
+                      (spec.type === "check" || spec.type === "tags"
+                        ? " sm:col-span-2"
+                        : "")
                     }
                   >
                     <span className="mb-1.5 block text-sm font-medium text-zinc-600">
@@ -661,17 +982,26 @@ export function ResourceScreen({
                         setDraft((d) => ({ ...d, [spec.field]: v }))
                       }
                       linkOptions={linkOptions}
+                      masterOptions={masterOptions}
                       t={t}
+                      canBackdate={canBackdate}
                     />
+                    {spec.hint && spec.type !== "image" && (
+                      <span className="mt-1 block text-xs leading-relaxed text-zinc-400">
+                        {t(spec.hint)}
+                      </span>
+                    )}
                   </label>
                 ))}
               </div>
               {editing !== "new" && config.extra && (
-                <config.extra row={editing} reload={load} />
+                <Suspense fallback={null}>
+                  <config.extra row={editing} reload={load} />
+                </Suspense>
               )}
               {error && (
                 <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-                  {error}
+                  {translate(error)}
                 </div>
               )}
             </div>

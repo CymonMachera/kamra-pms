@@ -5,8 +5,11 @@ export type SiteInfo = {
   version?: string
   app?: string
   site?: string
-  branch?: string | null
-  commit?: string | null
+  channel?: string | null
+  build?: string | null
+  /** The hotel's or partner's own name and logo (Website / Navbar Settings). */
+  brand_name?: string | null
+  brand_logo?: string | null
   frappe_version?: string
 }
 
@@ -19,4 +22,10 @@ export function getSiteInfo(): Promise<SiteInfo> {
     }))
   }
   return cached
+}
+
+/** "2.6.17", "2.6.17 · nightly", "2.6.17 · nightly · 8f32098" */
+export function versionLabel(info: SiteInfo | null): string | null {
+  if (!info?.version) return null
+  return [info.version, info.channel, info.build].filter(Boolean).join(" · ")
 }

@@ -44,6 +44,8 @@ from frappe.utils import (
 )
 
 from kamra.authz import require_roles
+from kamra.localization import money_text
+from kamra.settings import get_setting
 
 # who sells and runs functions
 BANQUET_ROLES = ("Front Desk", "Revenue Manager", "Kamra Agent")
@@ -63,11 +65,13 @@ DEAD = ("Cancelled", "Lost")
 
 # enquiry -> tentative -> confirmed -> completed, and out at any point.
 # Reopening a dead function is deliberate, not a slip, so it's allowed
-# back to Enquiry only.
+# back to Enquiry only. Completed is reached only through close_out (the
+# covers, the damage and the deposit settle in the same motion) and left
+# only through reopen_function (a reason, a narrower set of roles, a log).
 TRANSITIONS = {
 	"Enquiry": ("Tentative", "Confirmed", "Cancelled", "Lost"),
 	"Tentative": ("Confirmed", "Enquiry", "Cancelled", "Lost"),
-	"Confirmed": ("Completed", "Tentative", "Cancelled"),
+	"Confirmed": ("Tentative", "Cancelled"),
 	"Completed": (),
 	"Cancelled": ("Enquiry",),
 	"Lost": ("Enquiry",),
@@ -146,7 +150,7 @@ def banquet_catalogue(property: str):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*CATALOGUE_ROLES)
+@require_roles(*CATALOGUE_ROLES, scope={"name": "Banquet Menu"})
 def save_banquet_menu(property: str, menu_name: str, rate_per_pax: float,
                       courses=None, name: str | None = None, **kw):
 	"""Add or edit one menu package. Courses replace wholesale - the grid
@@ -183,14 +187,14 @@ def save_banquet_menu(property: str, menu_name: str, rate_per_pax: float,
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*CATALOGUE_ROLES)
+@require_roles(*CATALOGUE_ROLES, scope={"name": "Banquet Menu"})
 def delete_banquet_menu(name: str):
 	frappe.delete_doc("Banquet Menu", name)
 	return {"ok": True}
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*CATALOGUE_ROLES)
+@require_roles(*CATALOGUE_ROLES, scope={"name": "Banquet Service Item"})
 def save_service_item(property: str, item_name: str, category: str,
                       rate: float = 0, uom: str = "Per Event",
                       name: str | None = None, **kw):
@@ -217,7 +221,7 @@ def save_service_item(property: str, item_name: str, category: str,
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*CATALOGUE_ROLES)
+@require_roles(*CATALOGUE_ROLES, scope={"name": "Banquet Service Item"})
 def delete_service_item(name: str):
 	frappe.delete_doc("Banquet Service Item", name)
 	return {"ok": True}
@@ -234,23 +238,40 @@ def create_enquiry(property: str, venue: str, event_date: str,
                    company: str | None = None, end_date: str | None = None,
                    start_time: str | None = None, end_time: str | None = None,
                    source: str = "Phone", requirements: str | None = None,
-                   follow_up_days: int = 2, with_venue_line: int = 1,
-                   sales_owner: str | None = None):
+                   follow_up_days: int | None = None, with_venue_line: int = 1,
+                   sales_owner: str | None = None, session: str | None = None):
 	"""Open a function sheet from an enquiry. The hall's rack rental goes on
 	as the first line (that's the number the conversation starts from), and
-	a follow-up lands in the diary so the enquiry doesn't go quiet."""
+	a follow-up lands in the diary so the enquiry doesn't go quiet.
+
+	session is how the hall is sold (Morning / Afternoon / Evening / Full
+	Day): a named session sets the clock itself, so times sent alongside it
+	are ignored. Custom Hours, or no session with times, keeps the times."""
+	from kamra.kamra.doctype.venue_booking.venue_booking import (
+		SESSION_HOURS, SESSIONS)
+
 	if not (customer_name or "").strip():
 		frappe.throw(_("Whose function is this? A customer name is required."))
+	session = (session or "").strip() or None
+	if session and session not in SESSIONS:
+		frappe.throw(_("Unknown session {0}. Pick one of: {1}.").format(
+			session, ", ".join(SESSIONS)))
+	if session in SESSION_HOURS:
+		# the session decides the hours - and the hourly-rental test below
+		start_time, end_time = (t[:5] for t in SESSION_HOURS[session])
 	doc = frappe.get_doc({
 		"doctype": "Venue Booking",
 		"property": property, "venue": venue,
 		"event_type": event_type or "Other",
 		"status": "Enquiry",
 		"enquiry_date": nowdate(),
-		"follow_up_date": add_days(nowdate(), int(follow_up_days or 2)),
+		"follow_up_date": add_days(nowdate(), int(
+			follow_up_days if follow_up_days not in (None, "")
+			else get_setting(property, "banquet_follow_up_days"))),
 		"source": source or "Phone",
 		"sales_owner": sales_owner or frappe.session.user,
 		"event_date": event_date, "end_date": end_date or None,
+		"session": session,
 		"start_time": start_time or None, "end_time": end_time or None,
 		"customer_name": customer_name.strip()[:140],
 		"customer_phone": customer_phone, "customer_email": customer_email,
@@ -338,6 +359,11 @@ def update_function(function: str, fields):
 		frappe.throw(_("Not editable here: {0}").format(", ".join(sorted(unknown))))
 	doc = _fn(function)
 	_guard_closed(doc)
+	if "group_booking" in fields and (fields["group_booking"] or None) != doc.group_booking:
+		# the bill-routing link has its own checks (same property, not yet
+		# billed, the group's back-link) - one path, whichever caller
+		group = fields.pop("group_booking") or None
+		_set_group_link(doc, group)
 	for k, v in fields.items():
 		doc.set(k, v)
 	doc.save()
@@ -350,6 +376,88 @@ def _guard_closed(doc):
 		frappe.throw(_("This function is closed. Reopen it before editing."))
 
 
+# ══ the group it rides with ══════════════════════════════════════════════
+
+def _set_group_link(doc, group: str | None):
+	"""Tie (or untie) a function to a group booking. Sets the field and the
+	group's own `event` back-link; the caller saves the function."""
+	was = doc.group_booking
+	if group:
+		g = frappe.db.get_value(
+			"Group Booking", group, ["name", "property", "status", "event"],
+			as_dict=True)
+		if not g:
+			frappe.throw(_("Group booking {0} not found.").format(group))
+		if g.property != doc.property:
+			frappe.throw(_("Group {0} belongs to another property - a "
+			              "function can only ride a group at its own hotel.")
+			             .format(group))
+		if g.status == "Cancelled":
+			frappe.throw(_("Group {0} is cancelled.").format(group))
+		if g.event and g.event != doc.name:
+			frappe.throw(_("Group {0} is already tied to function {1}. "
+			              "Untie it there first.").format(group, g.event))
+	if doc.posted_to_folio and group != was:
+		frappe.throw(_("This function is already billed to {0} - its group "
+		              "can't change now.").format(doc.folio))
+	if was and was != group and frappe.db.get_value(
+			"Group Booking", was, "event") == doc.name:
+		frappe.db.set_value("Group Booking", was, "event", None)
+	if group:
+		frappe.db.set_value("Group Booking", group, "event", doc.name)
+	doc.group_booking = group
+
+
+@frappe.whitelist()
+@require_roles(*READ_ROLES)
+def linkable_groups(function: str):
+	"""Group bookings this function could ride: same property, not
+	cancelled, staying within a month either side of the event."""
+	doc = _fn(function)
+	day = getdate(doc.event_date)
+	rows = frappe.get_all(
+		"Group Booking",
+		filters={"property": doc.property, "status": ("!=", "Cancelled"),
+		         "check_out_date": (">=", add_days(day, -30)),
+		         "check_in_date": ("<=", add_days(day, 30))},
+		fields=["name", "group_name", "company", "check_in_date",
+		        "check_out_date", "status", "event"],
+		order_by="check_in_date asc", limit=100)
+	if doc.group_booking and not any(r.name == doc.group_booking for r in rows):
+		cur = frappe.db.get_value(
+			"Group Booking", doc.group_booking,
+			["name", "group_name", "company", "check_in_date",
+			 "check_out_date", "status", "event"], as_dict=True)
+		if cur:
+			rows.insert(0, cur)
+	return [{**r, "check_in_date": str(r.check_in_date),
+	         "check_out_date": str(r.check_out_date),
+	         "taken": bool(r.event and r.event != doc.name)} for r in rows]
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles(*BANQUET_ROLES)
+def link_group(function: str, group_booking: str | None = None):
+	"""Tie a function to a group booking so its bill can ride the group's
+	master folio (post_to_folio), or untie it (group_booking empty)."""
+	doc = _fn(function)
+	_guard_closed(doc)
+	was = doc.group_booking
+	group = (group_booking or "").strip() or None
+	if group == was:
+		return {"ok": True, "group_booking": was, "unchanged": True}
+	_set_group_link(doc, group)
+	doc.save()
+	from kamra.savings import log_action
+	log_action("banquet_group_link", "Venue Booking", doc.name, doc.property,
+	           rationale=(f"{doc.customer_name}: tied to group {group}"
+	                      if group else
+	                      f"{doc.customer_name}: untied from group {was}"),
+	           before_snapshot={"group_booking": was},
+	           after_snapshot={"group_booking": group})
+	return {"ok": True, "group_booking": group}
+
+
 @frappe.whitelist(methods=["POST"])
 @require_roles(*BANQUET_ROLES)
 def set_status(function: str, status: str, reason: str | None = None,
@@ -359,6 +467,13 @@ def set_status(function: str, status: str, reason: str | None = None,
 	doc = _fn(function)
 	if status == doc.status:
 		return {"ok": True, "status": status, "unchanged": True}
+	if status == "Completed" and doc.status == "Confirmed":
+		frappe.throw(_("Close the function out instead - close-out counts the "
+		              "covers, settles the deposit and then marks it "
+		              "Completed."))
+	if doc.status == "Completed":
+		frappe.throw(_("This function is closed. Reopen it (with a reason) "
+		              "before moving it."))
 	allowed = TRANSITIONS.get(doc.status, ())
 	if status not in allowed:
 		frappe.throw(_("A {0} function can't go straight to {1}. From here: "
@@ -642,22 +757,27 @@ def set_payment_terms(function: str, terms, note: str | None = None):
 
 @frappe.whitelist(methods=["POST"])
 @require_roles(*BANQUET_ROLES, "Finance")
-def default_payment_terms(function: str, advance_percent: float = 25,
-                          interim_percent: float = 50,
-                          interim_days_before: int = 15):
+def default_payment_terms(function: str, advance_percent: float | None = None,
+                          interim_percent: float | None = None,
+                          interim_days_before: int | None = None):
 	"""The usual three-milestone schedule, dated off this function: an
 	advance to hold the hall, a second call before the date, the rest on
-	completion. Editable afterwards like any other term."""
+	completion. Editable afterwards like any other term. Unset arguments
+	come from Settings -> Banquets & Groups."""
 	doc = _fn(function)
-	adv = float(advance_percent or 0)
-	mid = float(interim_percent or 0)
+
+	def pick(val, key):
+		return get_setting(doc.property, key) if val in (None, "") else val
+	adv = float(pick(advance_percent, "banquet_advance_pct") or 0)
+	mid = float(pick(interim_percent, "banquet_interim_pct") or 0)
+	interim_days_before = int(pick(interim_days_before, "banquet_interim_days") or 0)
 	if adv + mid > 100:
 		frappe.throw(_("The advance and interim add up to more than the bill."))
 	terms = [
 		{"milestone": _("Booking advance"), "percent": adv,
 		 "due_date": nowdate()},
 		{"milestone": _("Before the function"), "percent": mid,
-		 "due_date": add_days(doc.event_date, -int(interim_days_before or 15))},
+		 "due_date": add_days(doc.event_date, -interim_days_before)},
 		{"milestone": _("On completion"), "percent": round(100 - adv - mid, 2),
 		 "due_date": doc.end_date or doc.event_date},
 	]
@@ -677,8 +797,12 @@ def record_receipt(function: str, amount: float, mode: str = "Bank Transfer",
 	if kind not in ("Advance", "Payment", "Security Deposit", "Refund"):
 		frappe.throw(_("Unknown receipt kind: {0}").format(kind))
 	doc = _fn(function)
+	from kamra.localization import assert_payment_mode
+	assert_payment_mode(doc.property, mode)
+	from kamra.business_date import assert_transaction_date
+	rd = assert_transaction_date(doc.property, receipt_date, label="Receipt date")
 	doc.append("receipts", {
-		"receipt_date": receipt_date or nowdate(),
+		"receipt_date": rd,
 		"kind": kind, "mode": mode, "amount": float(amount),
 		"reference": reference, "received_by": frappe.session.user,
 	})
@@ -687,13 +811,14 @@ def record_receipt(function: str, amount: float, mode: str = "Bank Transfer",
 		if not term:
 			frappe.throw(_("No such payment term on this function."))
 		term.status = "Received"
-		term.received_on = receipt_date or nowdate()
+		term.received_on = rd
 		term.reference = reference or term.reference
 	doc.save()
 	from kamra.savings import log_action
 	log_action("banquet_receipt", "Venue Booking", doc.name, doc.property,
-	           rationale=f"{kind} ₹{float(amount):,.0f} ({mode}) for "
-	                     f"{doc.customer_name} - balance ₹{doc.balance_due:,.0f}")
+	           rationale=f"{kind} {money_text(doc.property, round(float(amount)))} ({mode}) for "
+	                     f"{doc.customer_name} - balance "
+	                     f"{money_text(doc.property, round(doc.balance_due or 0))}")
 	return {"ok": True, "received": doc.advance_received,
 	        "balance_due": doc.balance_due}
 
@@ -1046,7 +1171,8 @@ def run_banquet_reminders():
 						doc, next(a for a in f["alerts"]
 						          if a.get("kind") == "quote_no_response"))
 			except Exception:
-				pass
+				# a chase email must never break the diary - record it instead
+				frappe.log_error(title="Banquet: quote chase email failed")
 			sent = False
 			if f["sales_owner"]:
 				mobile = frappe.db.get_value("User", f["sales_owner"], "mobile_no")
@@ -1087,7 +1213,7 @@ def banquet_document(function: str, kind: str = "quote"):
 		"Property", doc.property,
 		["property_name", "legal_name", "address_line", "city", "state",
 		 "pincode", "country", "phone", "email", "website", "gstin",
-		 "logo_url"], as_dict=True) or {}
+		 "logo_url", "invoice_footer"], as_dict=True) or {}
 	prop["address"] = ", ".join(filter(None, [  # nosemgrep: frappe-no-functional-code -- drops empty address parts
 		prop.get("address_line"), prop.get("city"), prop.get("state"),
 		prop.get("pincode")]))
@@ -1116,7 +1242,7 @@ def banquet_document(function: str, kind: str = "quote"):
 		"kind": kind,
 		"title": {"quote": _("Quotation"), "contract": _("Function Contract"),
 		          "beo": _("Banquet Event Order"), "pack_list": _("Pack List"),
-		          "invoice": _("Tax Invoice")}[kind],
+		          "invoice": _(loc.invoice_title(pack))}[kind],
 		"number": number,
 		"is_final": bool(number != doc.name),
 		"function": doc.name,
@@ -1129,6 +1255,7 @@ def banquet_document(function: str, kind: str = "quote"):
 		"amount_in_words": loc.amount_in_words(pack, prop_doc, doc.grand_total),
 		"service_code_label": (ctx.get("service_code") or {}).get("label", "SAC"),
 		"footer": ctx.get("footer"),
+		"invoice_footer": prop.get("invoice_footer"),
 		"place_of_supply": ctx.get("place_of_supply"),
 		"tax_label": ctx.get("tax_label"),
 		"tax_id_label": ctx.get("tax_id_label"),
@@ -1349,7 +1476,8 @@ def generate_quote(function: str, valid_days: int = 15,
 	log_action("banquet_quote", "Venue Booking", doc.name, doc.property,
 	           minutes_saved=20,
 	           rationale=f"Quote v{doc.quote_version} for {doc.customer_name}: "
-	                     f"₹{doc.grand_total:,.0f} ({len(doc.items)} lines)")
+	                     f"{money_text(doc.property, round(doc.grand_total or 0))} "
+	                     f"({len(doc.items)} lines)")
 	return banquet_document(function, "quote")
 
 
@@ -1399,7 +1527,8 @@ def generate_invoice(function: str):
 		log_action("banquet_invoice", "Venue Booking", doc.name, doc.property,
 		           minutes_saved=10,
 		           rationale=f"Invoice {doc.invoice_number} for "
-		                     f"{doc.customer_name}: ₹{doc.grand_total:,.0f}")
+		                     f"{doc.customer_name}: "
+		                     f"{money_text(doc.property, round(doc.grand_total or 0))}")
 	return banquet_document(function, "invoice")
 
 
@@ -1422,7 +1551,7 @@ def post_to_folio(function: str, folio: str | None = None):
 	Alcohol is reported back rather than posted when the bill is a company
 	or group folio - the same rule the folio itself enforces - so it can be
 	settled separately instead of failing the whole post."""
-	from kamra.api import add_folio_charge
+	from kamra.api import _post_folio_charge
 
 	doc = _fn(function)
 	if doc.posted_to_folio:
@@ -1452,7 +1581,7 @@ def post_to_folio(function: str, folio: str | None = None):
 			deferred.append({"item_name": r.item_name,
 			                 "amount": float(r.total or 0)})
 			continue
-		add_folio_charge(
+		_post_folio_charge(
 			target,
 			_FOLIO_CHARGE_TYPE.get(r.item_type, "Misc"),
 			f"{doc.name} · {r.item_name}"
@@ -1507,9 +1636,13 @@ def close_out(function: str, damage_amount: float = 0,
 	if doc.status not in ("Confirmed", "Completed"):
 		frappe.throw(_("Only a confirmed function can be closed out - this "
 		              "one is {0}.").format(doc.status))
-	if doc.closed_out_on:
+	if doc.closed_out_on and doc.status == "Completed":
 		frappe.throw(_("This function was already closed out on {0}.")
 		             .format(doc.closed_out_on))
+	if doc.closed_out_on:
+		# reopened after a close-out: the deposit and the damage were settled
+		# the first time, so this close only re-counts covers and re-closes
+		return _reclose(doc, damage_amount, refund_deposit, pax_actual)
 	damage = float(damage_amount or 0)
 	if damage < 0:
 		frappe.throw(_("Damages can't be negative."))
@@ -1556,10 +1689,76 @@ def close_out(function: str, damage_amount: float = 0,
 	           minutes_saved=10,
 	           rationale=f"{doc.customer_name} closed out - "
 	                     f"{doc.billable_pax} actual pax, "
-	                     f"₹{damage:,.0f} damages, ₹{refund:,.0f} returned")
+	                     f"{money_text(doc.property, round(damage))} damages, "
+	                     f"{money_text(doc.property, round(refund))} returned")
 	return {"ok": True, "status": doc.status, "damage": damage,
 	        "refunded": refund, "deposit_held": doc.deposit_held,
 	        "balance_due": doc.balance_due, "grand_total": doc.grand_total}
+
+
+def _reclose(doc, damage_amount, refund_deposit, pax_actual):
+	"""Close a reopened function again. The money side of the first
+	close-out stands - a second deduction or refund would double it - so
+	only the covers can be re-counted here."""
+	if float(damage_amount or 0):
+		frappe.throw(_("Damages were settled at the first close-out ({0}). "
+		              "Bill anything further as a charge on the function.")
+		             .format(doc.closed_out_on))
+	held = float(doc.deposit_held or 0)
+	if int(refund_deposit or 0) and held > 0:
+		frappe.throw(_("{0} of deposit is still held. Record the refund as a "
+		              "receipt before closing again.")
+		             .format(frappe.format_value(held, "Currency")))
+	if pax_actual is not None:
+		doc.pax_actual = int(pax_actual)
+	doc.closed_out_on = now_datetime()
+	doc.closed_out_by = frappe.session.user
+	doc.status = "Completed"
+	doc.save()
+	from kamra.savings import log_action
+	log_action("banquet_close_out", "Venue Booking", doc.name, doc.property,
+	           rationale=f"{doc.customer_name} closed out again after a "
+	                     f"reopen - {doc.billable_pax} actual pax")
+	return {"ok": True, "status": doc.status, "damage": 0.0, "refunded": 0.0,
+	        "reclosed": True, "deposit_held": doc.deposit_held,
+	        "balance_due": doc.balance_due, "grand_total": doc.grand_total}
+
+
+# who may undo a close-out: the people who answer for the numbers, not
+# whoever is on the desk
+REOPEN_ROLES = ("Revenue Manager", "Finance", "Hotel Admin")
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles(*REOPEN_ROLES)
+def reopen_function(function: str, reason: str):
+	"""Reopen a closed (Completed) function so its sheet can be corrected.
+	It goes back to Confirmed; receipts, refunds and the damage line stay
+	as they were, and closing it again re-counts covers only. Needs a
+	reason, and lands on the activity log."""
+	doc = _fn(function)
+	if doc.status != "Completed":
+		frappe.throw(_("Only a closed (Completed) function can be reopened - "
+		              "this one is {0}.").format(doc.status))
+	if not (reason or "").strip():
+		frappe.throw(_("Say why - reopening a closed function needs a reason."))
+	if doc.posted_to_folio:
+		frappe.throw(_("This function is already billed to {0}. Correct the "
+		              "bill there (void / reverse) rather than reopening.")
+		             .format(doc.folio))
+	reason = reason.strip()[:500]
+	doc.status = "Confirmed"
+	note = _("Reopened by {0}: {1}").format(frappe.session.user, reason)
+	doc.internal_notes = ((doc.internal_notes + "\n")
+	                      if doc.internal_notes else "") + note
+	doc.save()
+	from kamra.savings import log_action
+	log_action("banquet_reopen", "Venue Booking", doc.name, doc.property,
+	           rationale=f"{doc.customer_name}: Completed → Confirmed ({reason})",
+	           before_snapshot={"status": "Completed",
+	                            "closed_out_on": str(doc.closed_out_on or "")},
+	           after_snapshot={"status": "Confirmed"})
+	return {"ok": True, "status": doc.status, "from": "Completed"}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -1888,7 +2087,7 @@ def dish_library(property: str, course_type: str | None = None):
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*CATALOGUE_ROLES)
+@require_roles(*CATALOGUE_ROLES, scope={"name": "Banquet Dish"})
 def save_dish(property: str, dish_name: str, recipe=None,
               name: str | None = None, **kw):
 	"""Add or edit a dish. The recipe is what makes it cost something -
@@ -1917,7 +2116,7 @@ def save_dish(property: str, dish_name: str, recipe=None,
 
 
 @frappe.whitelist(methods=["POST"])
-@require_roles(*CATALOGUE_ROLES)
+@require_roles(*CATALOGUE_ROLES, scope={"name": "Banquet Dish"})
 def delete_dish(name: str):
 	frappe.delete_doc("Banquet Dish", name)
 	return {"ok": True}
@@ -2388,10 +2587,14 @@ def link_customer(function: str, guest: str | None = None):
 
 
 def _find_or_create_guest(doc):
-	"""Dedupe on the phone number, the way the front desk does."""
-	phone = (doc.customer_phone or "").strip()
+	"""Dedupe on the phone number, the way the front desk does: read with
+	the property's country (#468), as typed when it can't be read."""
+	from kamra import phone as phone_mod
+	typed = (doc.customer_phone or "").strip()
+	phone = phone_mod.for_property(typed, doc.property)[0]
 	if phone:
-		existing = frappe.db.get_value("Guest", {"phone": phone})
+		existing = frappe.db.get_value(
+			"Guest", {"phone": phone_mod.matching(typed, doc.property)})
 		if existing:
 			return existing
 	parts = (doc.customer_name or "Guest").strip().split(" ", 1)
@@ -2412,9 +2615,13 @@ def customer_profile(property: str, guest: str | None = None,
 	phone: what this client has run with us, what they spent, what they
 	usually book, and what's still owed."""
 	if not guest and phone:
-		guest = frappe.db.get_value("Guest", {"phone": phone.strip()})
+		from kamra import phone as phone_mod
+		guest = frappe.db.get_value("Guest", {"phone": phone_mod.matching(phone, property)})
 	if not guest:
 		return {"found": False}
+	# a phone lookup resolves to a guest the decorator never saw
+	from kamra.authz import assert_guest_access
+	assert_guest_access(guest)
 	g = frappe.db.get_value(
 		"Guest", guest,
 		["name", "full_name", "phone", "email", "vip", "guest_notes",
@@ -2461,9 +2668,16 @@ def customer_profile(property: str, guest: str | None = None,
 # ══ before you send the price ════════════════════════════════════════════
 
 # What a banquet is expected to hold. Below the floor a function is worth
-# arguing about; below break-even it is worth refusing.
+# arguing about; below break-even it is worth refusing. Defaults - each
+# property sets its own in Settings -> Banquets & Groups.
 TARGET_MARGIN = 40.0
 FLOOR_MARGIN = 25.0
+
+
+def _margins(property: str | None) -> tuple[float, float]:
+	"""(target, floor) margin percent for a property."""
+	return (float(get_setting(property, "banquet_target_margin", TARGET_MARGIN)),
+	        float(get_setting(property, "banquet_floor_margin", FLOOR_MARGIN)))
 
 
 @frappe.whitelist()
@@ -2507,7 +2721,9 @@ def quote_advisor(function: str, at_discount: float | None = None):
 		 for r in doc.items if float(r.cost_amount or 0)),
 		key=lambda x: -x["cost"])[:5]
 
-	verdict, advice = _verdict(pct, bool(uncosted), cost)
+	target_margin, floor_margin = _margins(doc.property)
+	verdict, advice = _verdict(pct, bool(uncosted), cost,
+	                           target_margin, floor_margin)
 	return {
 		"function": doc.name, "pax": doc.billable_pax,
 		"subtotal": float(subtotal), "discount": float(discount),
@@ -2524,10 +2740,10 @@ def quote_advisor(function: str, at_discount: float | None = None):
 		"break_even_price": float(cost),
 		"max_discount": {
 			"to_break_even": headroom(0),
-			"to_floor": headroom(FLOOR_MARGIN),
-			"to_target": headroom(TARGET_MARGIN),
+			"to_floor": headroom(floor_margin),
+			"to_target": headroom(target_margin),
 		},
-		"target_margin": TARGET_MARGIN, "floor_margin": FLOOR_MARGIN,
+		"target_margin": target_margin, "floor_margin": floor_margin,
 		"verdict": verdict, "advice": advice,
 		"cost_drivers": drivers,
 		"uncosted_lines": uncosted,
@@ -2542,7 +2758,9 @@ def quote_advisor(function: str, at_discount: float | None = None):
 	}
 
 
-def _verdict(pct: float, uncosted: bool, cost) -> tuple:
+def _verdict(pct: float, uncosted: bool, cost,
+             target_margin: float = TARGET_MARGIN,
+             floor_margin: float = FLOOR_MARGIN) -> tuple:
 	if not cost:
 		return "unknown", _(
 			"Nothing on this quote carries a cost yet, so any margin shown "
@@ -2551,20 +2769,20 @@ def _verdict(pct: float, uncosted: bool, cost) -> tuple:
 	if pct < 0:
 		return "loss", _(
 			"This loses money at the current price.") + (
-			_(" And some lines still cost nothing, so it loses more.")
+			" " + _("And some lines still cost nothing, so it loses more.")
 			if uncosted else "")
 	if uncosted:
 		return "partial", _(
 			"Some lines still cost nothing, so the real margin is lower "
 			"than this. Treat it as a ceiling, not an answer.")
-	if pct < FLOOR_MARGIN:
+	if pct < floor_margin:
 		return "thin", _(
 			"Below the {0}% floor. Worth taking only for the rooms it "
 			"brings, or a date that would otherwise sit empty.").format(
-				FLOOR_MARGIN)
-	if pct < TARGET_MARGIN:
+				floor_margin)
+	if pct < target_margin:
 		return "ok", _("Workable, though under the {0}% a banquet "
-		              "normally holds.").format(TARGET_MARGIN)
+		              "normally holds.").format(target_margin)
 	return "good", _("Comfortably profitable at this price.")
 
 

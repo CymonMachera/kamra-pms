@@ -10,9 +10,10 @@ import {
 } from "lucide-react"
 import { call } from "../lib/api"
 import { serverError } from "../lib/resource"
-import { useT } from "../lib/i18n"
+import { useT, t as translate } from "../lib/i18n"
 import { Button } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
+
 
 type CheckStatus = "passed" | "attention" | "failed" | "info"
 
@@ -138,7 +139,7 @@ export default function SystemHealth() {
 
       {error && (
         <p className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-          {error}
+          {translate(error)}
         </p>
       )}
 
@@ -162,7 +163,7 @@ export default function SystemHealth() {
                   kamra {data.installed.kamra}
                 </p>
                 <p className="text-xs text-zinc-500">
-                  Frappe {data.installed.frappe ?? "—"}
+                  Frappe {data.installed.frappe ?? "-"}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-100 bg-zinc-50 px-3 py-2">
@@ -275,6 +276,15 @@ export default function SystemHealth() {
                   className="inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:underline"
                 >
                   {t("Self-hosting docs")}
+                  <ExternalLink className="size-3.5" aria-hidden />
+                </a>
+                <a
+                  href="https://kamrapms.com/docs/quickstart#going-back-downgrade"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:underline"
+                >
+                  {t("Going back (downgrade)")}
                   <ExternalLink className="size-3.5" aria-hidden />
                 </a>
               </div>

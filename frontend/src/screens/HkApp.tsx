@@ -16,7 +16,8 @@ import Login from "./Login"
 import HkLaundry from "./HkLaundry"
 import { serverError } from "../lib/resource"
 import { cur } from "../lib/money"
-import { useT } from "../lib/i18n"
+import { useT, t as translate } from "../lib/i18n"
+
 
 /** The housekeeper's phone app - big targets, one thumb, zero training. */
 
@@ -39,6 +40,9 @@ interface HkTask {
   overdue: boolean
   media: string[]
 }
+
+// who may pass an inspection or verify a clean - the server enforces the same rule
+const SUPERVISOR_ROLES = ["Housekeeping Supervisor", "Front Desk", "Hotel Admin", "System Manager", "Kamra Agent"]
 
 const isVideo = (url: string) => /\.(mp4|mov|webm|m4v|3gp|avi)$/i.test(url)
 
@@ -67,6 +71,10 @@ const hkTone: Record<HkRoom["housekeeping_status"], string> = {
 export default function HkApp() {
   const { t } = useT()
   const [auth, setAuth] = useState<"loading" | "anon" | "ok">("loading")
+  const [supervisor, setSupervisor] = useState(false)
+  // a refused action (taken by someone else, not allowed…) - shown, never swallowed
+  const [notice, setNotice] = useState<string | null>(null)
+  const [logErr, setLogErr] = useState<string | null>(null)
   const [data, setData] = useState<{ tasks: HkTask[]; rooms: HkRoom[] } | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [view, setView] = useState<"mine" | "pool" | "rooms" | "laundry">("mine")
@@ -79,7 +87,13 @@ export default function HkApp() {
 
   const checkAuth = () =>
     whoami()
-      .then((w) => setAuth(w.user === "Guest" ? "anon" : "ok"))
+      .then((w) => {
+        setSupervisor(
+          w.user === "Administrator" ||
+            (w.roles ?? []).some((r: string) => SUPERVISOR_ROLES.includes(r)),
+        )
+        setAuth(w.user === "Guest" ? "anon" : "ok")
+      })
       .catch((e) => {
         // an unreachable server is not a sign-out - keep trying quietly
         if (isNetworkError(e)) setTimeout(checkAuth, 4000)
@@ -106,9 +120,16 @@ export default function HkApp() {
 
   async function run(task: string, method: string, params: Record<string, unknown> = {}) {
     setBusy(task)
+    setNotice(null)
     try {
       await call(method, { task, ...params })
       load()
+      return true
+    } catch (e) {
+      // e.g. "Already taken by …" - say so, and refresh so the card moves on
+      setNotice(serverError(e))
+      load()
+      return false
     } finally {
       setBusy(null)
     }
@@ -132,7 +153,7 @@ export default function HkApp() {
 
   // remove a photo/video from the task
   async function removeMedia(task: string, url: string) {
-    if (!confirm("Remove this photo/video?")) return
+    if (!confirm(translate("Remove this photo/video?"))) return
     setBusy(task)
     try {
       await call("kamra.api.hk_delete_media", { task, file_url: url })
@@ -213,7 +234,8 @@ export default function HkApp() {
               <button
                 disabled={busy === task.name}
                 onClick={() =>
-                  run(task.name, "kamra.api.hk_reject_task", { reason }).then(() => {
+                  run(task.name, "kamra.api.hk_reject_task", { reason }).then((ok) => {
+                    if (!ok) return
                     setRejecting(null)
                     setReason("")
                   })
@@ -310,13 +332,25 @@ export default function HkApp() {
                 {t("In progress…")}
               </span>
             )}
-            <button
-              disabled={busy === task.name}
-              onClick={() => run(task.name, "kamra.api.hk_update_task", { status: "Done" })}
-              className="flex-1 rounded-xl bg-brand-600 py-3 text-base font-semibold text-white active:bg-brand-700"
-            >
-              {t("Done ✓")}
-            </button>
+            {task.task_type === "Inspection" ? (
+              // an inspection is passed (room → Inspected / Ready), not "done"
+              <button
+                disabled={busy === task.name || !supervisor}
+                title={(supervisor ? undefined : t("A supervisor passes the inspection"))}
+                onClick={() => run(task.name, "kamra.api.hk_update_task", { status: "Verified" })}
+                className="flex-1 rounded-xl bg-sky-600 py-3 text-base font-semibold text-white active:bg-sky-700 disabled:opacity-50"
+              >
+                {supervisor ? t("Pass inspection ✓") : t("Supervisor passes")}
+              </button>
+            ) : (
+              <button
+                disabled={busy === task.name}
+                onClick={() => run(task.name, "kamra.api.hk_update_task", { status: "Done" })}
+                className="flex-1 rounded-xl bg-brand-600 py-3 text-base font-semibold text-white active:bg-brand-700"
+              >
+                {t("Done ✓")}
+              </button>
+            )}
           </div>
         </>
       )}
@@ -330,7 +364,7 @@ export default function HkApp() {
         <span className="font-semibold">{t("Housekeeping")}</span>
         <span className="ml-auto flex items-center gap-3">
           <button
-            onClick={() => { setLogItem({ desc: "", condition: "Found", room: "" }); setLogMsg(null) }}
+            onClick={() => { setLogItem({ desc: "", condition: "Found", room: "" }); setLogMsg(null); setLogErr(null) }}
             aria-label={t("Log a lost or found item")}
           >
             <PackageSearch className="size-5 text-zinc-400" />
@@ -348,6 +382,17 @@ export default function HkApp() {
       </header>
 
       <main className="mx-auto max-w-lg px-3 py-4">
+        {notice && (
+          <div
+            role="alert"
+            className="mb-3 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-800"
+          >
+            <span className="flex-1">{notice}</span>
+            <button onClick={() => setNotice(null)} aria-label={t("Dismiss")}>
+              <X className="size-4" />
+            </button>
+          </div>
+        )}
         {view === "mine" && (
           <>
             <p className="mb-3 px-1 text-sm text-zinc-500">
@@ -404,7 +449,7 @@ export default function HkApp() {
                 )}
               >
                 {r.vip ? (
-                  <Star className="absolute right-1.5 top-1.5 size-3.5 fill-amber-400 text-amber-400" aria-label="VIP" />
+                  <Star className="absolute right-1.5 top-1.5 size-3.5 fill-amber-400 text-amber-400" aria-label={translate("VIP")} />
                 ) : null}
                 <div className="flex items-center justify-center gap-1 text-xl font-bold">
                   {r.room_number}
@@ -418,12 +463,12 @@ export default function HkApp() {
                 <div className="mt-1 flex items-center justify-center gap-1">
                   {r.arrival_today && (
                     <span className="inline-flex items-center gap-0.5 text-[9px] font-medium">
-                      <Plane className="size-3" aria-label="Arrival today" />
+                      <Plane className="size-3" aria-label={translate("Arrival today")} />
                       {r.eta || ""}
                     </span>
                   )}
                   {r.departure_today ? (
-                    <Clock className="size-3" aria-label="Departure today" />
+                    <Clock className="size-3" aria-label={translate("Departure today")} />
                   ) : null}
                 </div>
               </button>
@@ -456,7 +501,7 @@ export default function HkApp() {
               view === key ? "text-brand-700" : "text-zinc-400",
             )}
           >
-            {label}
+            {translate(label)}
           </button>
         ))}
       </nav>
@@ -518,6 +563,11 @@ export default function HkApp() {
                     <option key={r.name} value={r.name}>{r.room_number}</option>
                   ))}
                 </select>
+                {logErr && (
+                  <p role="alert" className="rounded-xl bg-rose-50 px-3 py-2.5 text-sm text-rose-800">
+                    {logErr}
+                  </p>
+                )}
                 <div className="flex gap-2">
                   <button
                     className="flex-1 rounded-xl border border-zinc-300 py-3 text-base font-semibold text-zinc-600"
@@ -530,6 +580,7 @@ export default function HkApp() {
                     className="flex-1 rounded-xl bg-brand-600 py-3 text-base font-semibold text-white disabled:opacity-50"
                     onClick={async () => {
                       setBusy("log")
+                      setLogErr(null)
                       try {
                         await call("kamra.api.hk_log_item", {
                           property: getCurrentProperty(),
@@ -541,6 +592,8 @@ export default function HkApp() {
                           condition: logItem.condition.toLowerCase(),
                           desc: logItem.desc.trim(),
                         }))
+                      } catch (e) {
+                        setLogErr(serverError(e))
                       } finally {
                         setBusy(null)
                       }
@@ -575,9 +628,7 @@ export default function HkApp() {
                 <button
                   className="w-full rounded-xl bg-brand-600 py-3 text-base font-semibold text-white"
                   onClick={() => setCharge(null)}
-                >
-                  Done
-                </button>
+                >{translate("Done")}</button>
               </div>
             ) : (
               <div className="space-y-3">
@@ -599,7 +650,7 @@ export default function HkApp() {
                 </div>
                 <input
                   className="w-full rounded-xl border border-zinc-300 px-3 py-3 text-base"
-                  placeholder={charge.type === "Minibar" ? t("e.g. 2 cola, 1 water") : t("e.g. 3 shirts pressed")}
+                  placeholder={(charge.type === "Minibar" ? t("e.g. 2 cola, 1 water") : t("e.g. 3 shirts pressed"))}
                   value={charge.desc}
                   autoFocus
                   onChange={(e) => setCharge({ ...charge, desc: e.target.value })}

@@ -1,12 +1,15 @@
+
 import { useCallback, useEffect, useState } from "react"
 import { MoonStar } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { call, getCurrentProperty } from "../lib/api"
-import { listResource, serverError, type Row } from "../lib/resource"
+import { listResource, type Row } from "../lib/resource"
+import { auditHistory, type RunRow } from "../lib/eod"
 import { Badge } from "../components/ui/badge"
 import { Button } from "../components/ui/button"
-import { cur, moneyLocale } from "../lib/money"
-import { useT } from "../lib/i18n"
+import { cur, fmtMoney, moneyLocale } from "../lib/money"
+import { DataTable } from "../components/ui/data-table"
+import { useT, uiDateLocale } from "../lib/i18n"
 import {
   Card,
   CardContent,
@@ -19,7 +22,7 @@ const inr = (n: unknown) =>
 
 const fmtDate = (d: unknown) =>
   d
-    ? new Date(String(d) + "T00:00:00").toLocaleDateString("en-IN", {
+    ? new Date(String(d) + "T00:00:00").toLocaleDateString(uiDateLocale(moneyLocale()), {
         day: "2-digit",
         month: "short",
         year: "numeric",
@@ -28,27 +31,21 @@ const fmtDate = (d: unknown) =>
 const fmtWhen = (d: unknown) =>
   d
     ? new Date(String(d).replace(" ", "T").slice(0, 19)).toLocaleString(
-        "en-IN",
+        uiDateLocale(moneyLocale()),
         { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" },
       )
     : ""
 
-interface AuditResult {
-  audit?: string
-  already_ran?: boolean
-  room_charges_posted?: number
-  amount_posted?: number
-  no_shows_flagged?: number
-  folios_opened?: number
+type GuestOwing = {
+  folio: string; guest_name: string; balance: number; reservation: string
+  status: string; check_in_date: string; check_out_date: string
 }
 
 export default function Billing() {
   const { t } = useT()
   const [folios, setFolios] = useState<Row[]>([])
-  const [audit, setAudit] = useState<AuditResult | null>(null)
-  const [auditErr, setAuditErr] = useState<string | null>(null)
-  const [auditRuns, setAuditRuns] = useState<Row[]>([])
-  const [busy, setBusy] = useState(false)
+  const [auditRuns, setAuditRuns] = useState<RunRow[]>([])
+  const [owing, setOwing] = useState<GuestOwing[]>([])
   const navigate = useNavigate()
 
   const load = useCallback(() => {
@@ -60,91 +57,45 @@ export default function Billing() {
       filters: [["property", "=", getCurrentProperty()]],
       orderBy: "modified desc",
     }).then(setFolios)
-    listResource("Night Audit Run", {
-      fields: [
-        "name", "business_date", "status", "room_charges_posted",
-        "amount_posted", "no_shows_flagged", "folios_opened", "creation",
-      ],
-      filters: [["property", "=", getCurrentProperty()]],
-      orderBy: "creation desc",
-      limit: 8,
-    })
+    // departed guests who still owe: the desk chases these, not credit control
+    call<GuestOwing[]>("kamra.receivables.guests_owing", { property: getCurrentProperty() })
+      .then(setOwing).catch(() => setOwing([]))
+    auditHistory(getCurrentProperty(), 8)
       .then(setAuditRuns)
       .catch(() => setAuditRuns([]))
   }, [])
 
   useEffect(load, [load])
 
-  async function runAudit() {
-    setBusy(true)
-    setAuditErr(null)
-    setAudit(null)
-    try {
-      const res = await call<AuditResult>("kamra.api.run_night_audit", {
-        property: getCurrentProperty(),
-      })
-      setAudit(res)
-      load()
-    } catch (e) {
-      setAuditErr(serverError(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
   return (
     <div className="space-y-4">
       <Card>
         <CardHeader>
           <div>
-            <CardTitle>{t("Night audit")}</CardTitle>
+            <CardTitle>{t("Night Audit")}</CardTitle>
             <p className="mt-0.5 text-xs text-zinc-400">
-              {t("Posts tonight's room charges for every in-house guest and flags no-shows. Runs automatically at 3 AM; run it manually anytime.")}
+              {t("Clear what is open, post room and tax, roll the business date and print the audit pack. Runs automatically every night at the time set in Settings.")}
             </p>
           </div>
-          <Button disabled={busy} onClick={runAudit}>
+          <Button onClick={() => navigate(`/end-of-day/${encodeURIComponent(getCurrentProperty())}`)}>
             <MoonStar className="size-4" aria-hidden />
-            {busy ? t("Running…") : t("Run night audit")}
+            {t("Open Night Audit")}
           </Button>
         </CardHeader>
-        {auditErr && (
-          <CardContent className="pt-0">
-            <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-              {auditErr}
-            </p>
-          </CardContent>
-        )}
-        {audit && (
-          <CardContent className="pt-0">
-            {audit.already_ran ? (
-              <p className="text-sm text-zinc-500">
-                {t("Already ran for today ({audit}).", { audit: audit.audit ?? "" })}
-              </p>
-            ) : (
-              <p className="text-sm text-zinc-600">
-                <span className="font-medium">{audit.audit}</span> -{" "}
-                {t("posted {n} room night{s} ({amount}), opened {folios} folio{s2}, flagged {noShows} no-show{s3}.", {
-                  n: audit.room_charges_posted ?? 0,
-                  s: audit.room_charges_posted === 1 ? "" : "s",
-                  amount: `${cur()}${inr(audit.amount_posted)}`,
-                  folios: audit.folios_opened ?? 0,
-                  s2: audit.folios_opened === 1 ? "" : "s",
-                  noShows: audit.no_shows_flagged ?? 0,
-                  s3: audit.no_shows_flagged === 1 ? "" : "s",
-                })}
-              </p>
-            )}
-          </CardContent>
-        )}
         {auditRuns.length > 0 && (
           <CardContent className="pt-0">
-            <div className="mb-1.5 text-xs font-medium uppercase tracking-wider text-zinc-400">
-              {t("Recent runs")}
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wider text-zinc-400">
+                {t("Recent runs")}
+              </span>
+              <button type="button" className="text-xs text-brand-700 hover:underline" onClick={() => navigate("/end-of-day")}>
+                {t("All audits")}
+              </button>
             </div>
             <ul className="divide-y divide-zinc-100 text-sm">
               {auditRuns.map((r) => (
                 <li
-                  key={String(r.name)}
+                  key={r.name}
                   className="flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 py-1.5"
                 >
                   <span className="w-28 font-medium">
@@ -160,10 +111,25 @@ export default function Billing() {
                       noShows: Number(r.no_shows_flagged) || 0,
                       s3: Number(r.no_shows_flagged) === 1 ? "" : "s",
                     })}
+                    {Number(r.late_arrivals_held) > 0 &&
+                      ` · ${t("{n} late arrival(s) held", { n: Number(r.late_arrivals_held) })}`}
+                    {Number(r.exceptions) > 0 &&
+                      ` · ${t("{n} exception(s)", { n: Number(r.exceptions) })}`}
                   </span>
                   <span className="text-xs text-zinc-400">
                     {t("ran {when}", { when: fmtWhen(r.creation) })}
                   </span>
+                  {r.has_pack ? (
+                    <button
+                      type="button"
+                      className="text-xs text-brand-700 hover:underline"
+                      onClick={() => navigate(`/end-of-day/pack/${encodeURIComponent(r.name)}`)}
+                    >
+                      {t("View audit pack")}
+                    </button>
+                  ) : (
+                    <span className="text-xs text-zinc-300">{t("No pack")}</span>
+                  )}
                 </li>
               ))}
             </ul>
@@ -184,6 +150,30 @@ export default function Billing() {
           </Button>
         </CardHeader>
       </Card>
+
+      {owing.length ? (
+        <Card>
+          <CardHeader>
+            <div>
+              <CardTitle>{t("Guests left owing")}</CardTitle>
+              <p className="mt-0.5 text-xs text-zinc-400">{t("Departed stays with a balance. Open the folio to take the payment or move it to a company.")}</p>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <DataTable<GuestOwing>
+              id="billing.guests_owing" exportName="guests-left-owing" rows={owing} rowKey={(g) => g.folio}
+              onRowClick={(g) => navigate(`/billing/${encodeURIComponent(g.folio)}`)}
+              columns={[
+                { key: "guest_name", label: t("Guest"), render: (g) => <span className="font-medium">{g.guest_name}</span> },
+                { key: "reservation", label: t("Booking"), render: (g) => <span className="font-mono text-xs">{g.reservation}</span> },
+                { key: "check_in_date", label: t("Stay"), render: (g) => <span className="text-xs text-zinc-500">{g.check_in_date} → {g.check_out_date}</span> },
+                { key: "status", label: t("Status"), render: (g) => <span className="text-xs">{t(g.status)}</span> },
+                { key: "balance", label: t("Owed"), align: "right", render: (g) => <span className="font-medium">{fmtMoney(g.balance)}</span> },
+              ]}
+            />
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Card>
         <CardHeader>

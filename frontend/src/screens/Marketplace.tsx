@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useState } from "react"
 import { useNavigate } from "react-router-dom"
-import { Check, Copy, Store, Terminal } from "lucide-react"
+import { Check, Copy, ExternalLink, Store, Terminal } from "lucide-react"
 
 import { call, getCurrentProperty } from "../lib/api"
 import { serverError } from "../lib/resource"
 import { Button } from "../components/ui/button"
-import { useT } from "../lib/i18n"
+import ConnectApp from "../components/ConnectApp"
+import { useAuth } from "../lib/auth"
+import { useT, t as translate } from "../lib/i18n"
+
 
 interface Card {
-  kind: "module" | "connector" | "bench_app" | "enterprise"
+  kind: "module" | "connector" | "bench_app" | "custom" | "link" | "enterprise"
   name: string
   blurb: string
   status: string
@@ -19,6 +22,7 @@ interface Card {
   key?: string
   command?: string | null
   connection?: string | null
+  links?: { label: string; href: string }[]
 }
 interface Category {
   category: string
@@ -26,22 +30,13 @@ interface Category {
   cards: Card[]
 }
 
-interface HeyKoalaResult {
-  connection: string
-  channel: string
-  phone_number: string
-  webhook_url: string
-  webhook_secret: string
-  signature_header: string
-  signature_note: string
-}
-
 const STATUS_STYLE: Record<string, string> = {
   included: "bg-emerald-50 text-emerald-700",
   connected: "bg-emerald-50 text-emerald-700",
   configure: "bg-amber-50 text-amber-700",
   available: "bg-sky-50 text-sky-700",
-  enterprise: "bg-violet-50 text-violet-700",
+  on_request: "bg-violet-50 text-violet-700",
+  help_wanted: "bg-sky-50 text-sky-700",
   planned: "bg-zinc-100 text-zinc-500",
 }
 const STATUS_LABEL: Record<string, string> = {
@@ -49,7 +44,8 @@ const STATUS_LABEL: Record<string, string> = {
   connected: "Connected",
   configure: "Set up",
   available: "Available",
-  enterprise: "Enterprise",
+  on_request: "On request",
+  help_wanted: "Help wanted",
   planned: "Planned",
 }
 
@@ -75,13 +71,12 @@ export default function Marketplace() {
   const { t } = useT()
   const [cats, setCats] = useState<Category[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [wizard, setWizard] = useState<string | null>(null) // card name
-  const [phone, setPhone] = useState("")
-  const [busy, setBusy] = useState(false)
-  const [result, setResult] = useState<HeyKoalaResult | null>(null)
   const [enquired, setEnquired] = useState<Set<string>>(new Set())
   const navigate = useNavigate()
   const property = getCurrentProperty()
+  // connecting an app creates a service account: IT only, like the server
+  const { roles } = useAuth()
+  const isIT = ["System Manager", "Administrator"].some((r) => roles.includes(r))
 
   const load = useCallback(() => {
     call<Category[]>("kamra.marketplace.registry", { property })
@@ -89,23 +84,6 @@ export default function Marketplace() {
       .catch((e) => setError(serverError(e)))
   }, [property])
   useEffect(load, [load])
-
-  async function connectHeyKoala(channel: string) {
-    setBusy(true)
-    setError(null)
-    try {
-      const r = await call<HeyKoalaResult>(
-        "kamra.marketplace.connect_heykoala",
-        { property, channel, phone_number: phone.trim() },
-      )
-      setResult(r)
-      load()
-    } catch (e) {
-      setError(serverError(e))
-    } finally {
-      setBusy(false)
-    }
-  }
 
   return (
     <div className="space-y-6">
@@ -119,24 +97,25 @@ export default function Marketplace() {
 
       {error && (
         <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-          {error}
+          {translate(error)}
         </div>
       )}
+
+      {isIT && <ConnectApp />}
 
       {cats.map((cat) => (
         <section key={cat.category} className="space-y-3">
           <div>
             <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500">
-              {cat.category}
+              {translate(cat.category)}
             </h2>
-            <p className="mt-0.5 text-xs text-zinc-400">{cat.blurb}</p>
+            <p className="mt-0.5 text-xs text-zinc-400">{translate(cat.blurb)}</p>
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {cat.cards.map((c) => {
-              const isKoala = c.key === "heykoala"
               return (
                 <div
-                  key={c.name + (c.channel ?? "")}
+                  key={c.name}
                   className="flex flex-col rounded-2xl border border-zinc-200 bg-white p-4"
                 >
                   <div className="flex items-start justify-between gap-2">
@@ -154,7 +133,7 @@ export default function Marketplace() {
                         : t(STATUS_LABEL[c.status] ?? c.status)}
                     </span>
                   </div>
-                  <p className="mt-1 flex-1 text-sm text-zinc-500">{c.blurb}</p>
+                  <p className="mt-1 flex-1 text-sm text-zinc-500">{translate(c.blurb)}</p>
 
                   {c.status === "connected" && c.detail && (
                     <p className="mt-2 text-xs text-emerald-700">{c.detail}</p>
@@ -170,7 +149,23 @@ export default function Marketplace() {
                       </span>
                     </div>
                   )}
-                  {c.kind === "enterprise" && (
+                  {c.kind === "link" && (
+                    <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
+                      {c.links?.map((l) => (
+                        <a
+                          key={l.href}
+                          href={l.href}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:underline"
+                        >
+                          {translate(l.label)}
+                          <ExternalLink className="size-3.5" aria-hidden />
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                  {(c.kind === "custom" || c.kind === "enterprise") && (
                     enquired.has(c.name) ? (
                       <p className="mt-3 text-sm text-violet-700">
                         {t("Thanks - our team will reach out about {name}.", { name: c.name })}
@@ -188,9 +183,26 @@ export default function Marketplace() {
                           )
                         }
                       >
-                        {t("Request implementation")}
+                        {c.kind === "enterprise"
+                          ? t("Contact us for a quote")
+                          : t("Request a custom integration")}
                       </Button>
                     )
+                  )}
+                  {c.kind === "enterprise" && c.action === "pair" && isIT && (
+                    <Button
+                      variant="ghost"
+                      className="mt-2"
+                      onClick={() => {
+                        // pairing lives in Connected apps above: paste the
+                        // address the Kamra Enterprise team gives you
+                        const input = document.getElementById("app-url")
+                        input?.scrollIntoView({ behavior: "smooth", block: "center" })
+                        input?.focus()
+                      }}
+                    >
+                      {t("Connect")}
+                    </Button>
                   )}
                   {c.kind === "connector" &&
                     c.action === "route" &&
@@ -203,98 +215,6 @@ export default function Marketplace() {
                         {c.status === "connected" ? t("Manage") : t("Set up")}
                       </Button>
                     )}
-                  {isKoala && c.status !== "connected" && (
-                    <Button
-                      variant="outline"
-                      className="mt-3"
-                      onClick={() => {
-                        setWizard(c.name)
-                        setResult(null)
-                        setPhone("")
-                      }}
-                    >
-                      Connect
-                    </Button>
-                  )}
-                  {isKoala && c.status === "connected" && c.connection && (
-                    <Button
-                      variant="ghost"
-                      className="mt-3"
-                      disabled={busy}
-                      onClick={() =>
-                        call("kamra.marketplace.disconnect_channel", {
-                          connection: c.connection,
-                        }).then(load)
-                      }
-                    >
-                      {t("Disconnect")}
-                    </Button>
-                  )}
-
-                  {/* HeyKoala inline wizard */}
-                  {isKoala && wizard === c.name && (
-                    <div className="mt-3 space-y-2 rounded-lg bg-zinc-50 p-3">
-                      {!result ? (
-                        <>
-                          <label className="block text-xs font-medium text-zinc-600">
-                            {c.channel} number
-                          </label>
-                          <input
-                            className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm"
-                            placeholder="+91 80 4000 8000"
-                            value={phone}
-                            onChange={(e) => setPhone(e.target.value)}
-                          />
-                          <div className="flex gap-2">
-                            <Button
-                              disabled={busy || !phone.trim()}
-                              onClick={() => connectHeyKoala(c.channel!)}
-                            >
-                              {busy ? t("Connecting...") : t("Connect")}
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              onClick={() => setWizard(null)}
-                            >
-                              {t("Cancel")}
-                            </Button>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="space-y-2 text-xs">
-                          <p className="font-medium text-emerald-700">
-                            {t("Connected. Paste these into HeyKoala:")}
-                          </p>
-                          <div>
-                            <div className="text-zinc-500">{t("Webhook URL")}</div>
-                            <div className="flex items-center gap-1 break-all font-mono text-zinc-700">
-                              {result.webhook_url}
-                              <Copyable value={result.webhook_url} />
-                            </div>
-                          </div>
-                          <div>
-                            <div className="text-zinc-500">
-                              {t("Secret (shown once)")}
-                            </div>
-                            <div className="flex items-center gap-1 break-all font-mono text-zinc-700">
-                              {result.webhook_secret}
-                              <Copyable value={result.webhook_secret} />
-                            </div>
-                          </div>
-                          <p className="text-zinc-400">
-                            {result.signature_note} Goes live once HeyKoala
-                            confirms.
-                          </p>
-                          <Button
-                            variant="ghost"
-                            onClick={() => setWizard(null)}
-                          >
-                            {t("Done")}
-                          </Button>
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </div>
               )
             })}

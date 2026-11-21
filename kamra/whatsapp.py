@@ -26,9 +26,12 @@ through _post_graph so the eval harness can intercept them.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 
 import frappe
+from frappe import _
 
 from kamra.authz import require_roles
 
@@ -111,8 +114,16 @@ def send_text(property: str, to: str, body: str, *,
 
 
 def send_template(property: str, to: str, template: str, args: list, *,
-                  guest=None, reservation=None, lang=None) -> dict:
-	"""Template message - the only way WhatsApp lets a business initiate."""
+                  guest=None, reservation=None, lang=None,
+                  marketing: bool = False) -> dict:
+	"""Template message - the only way WhatsApp lets a business initiate.
+
+	marketing=True marks a promotional template (Meta category MARKETING):
+	it goes only to a guest who opted in. Service templates (booking,
+	check-in link, payment) are unaffected."""
+	if marketing and not frappe.db.get_value(
+			"Guest", guest or {"phone": ("in", [to, f"+{to}"])}, "marketing_consent"):
+		return {"sent": False, "reason": "no_marketing_consent"}
 	conn = _conn(property)
 	if not conn:
 		return {"sent": False, "reason": "no_meta_connection"}
@@ -181,16 +192,92 @@ def notify_booking_confirmed(reservation: str) -> dict:
 	return out
 
 
+# charges that are the stay itself, or not money the guest spent: no alert
+NO_ALERT_CHARGES = {"Room", "Meal Plan", "Room Levy", "Extra Guests", "Discount",
+                    "Allowance", "Opening Balance"}
+ROOM_CHARGE_ALERT_GAP = 600  # seconds: at most one alert per bill in this window
+
+
+def queue_room_charge_alert(folio, charge) -> bool:
+	"""After a charge is posted to a guest's bill (restaurant, laundry,
+	minibar, the desk): queue a WhatsApp alert, sent after the posting
+	commits. Off unless the property turns on room_charge_whatsapp and the
+	connection names tpl_room_charge. Skips company and group bills, room
+	nights (the night audit never comes here), zero and negative lines, and
+	stays not in house; at most one alert per bill every 10 minutes (the
+	next one carries the running balance), claimed when the job runs. Never raises: posting a charge
+	must not fail over a message. True when queued."""
+	try:
+		charge = charge if isinstance(charge, dict) else charge.as_dict()
+		if (folio.get("folio_type") or "Guest") not in ("Guest", "Extra") \
+				or charge.get("charge_type") in NO_ALERT_CHARGES \
+				or float(charge.get("amount") or 0) <= 0:
+			return False
+		from kamra.settings import get_setting
+		if not get_setting(folio.property, "room_charge_whatsapp"):
+			return False
+		conn = _conn(folio.property)
+		if not (conn and conn.get("tpl_room_charge")):
+			return False
+		reservation = charge.get("reservation") or folio.get("reservation")
+		if not reservation or frappe.db.get_value(
+				"Reservation", reservation, "status") != "Checked In":
+			return False
+		# the 10-minute throttle is claimed by the job, after the posting
+		# commits: a rolled-back posting never uses up the window
+		frappe.enqueue("kamra.whatsapp.send_room_charge_alert", queue="short",
+		               enqueue_after_commit=True, folio=folio.name,
+		               reservation=reservation,
+		               amount=float(charge.get("total") or 0) or float(charge.get("amount") or 0),
+		               description=charge.get("description") or charge.get("charge_type") or "")
+		return True
+	except Exception:
+		frappe.log_error(title="WhatsApp room charge alert not queued")
+		return False
+
+
+def send_room_charge_alert(folio: str, reservation: str, amount: float,
+                           description: str) -> dict:
+	"""The queued half of queue_room_charge_alert. Template args:
+	    {{1}} guest name  {{2}} amount  {{3}} what and where  {{4}} balance"""
+	cache = frappe.cache()
+	# ponytail: throttle, not batch - a charge inside the window shows up
+	# only in the next alert's balance
+	if not cache.set(cache.make_key(f"kamra_wa_room_charge:{folio}"), 1,
+	                 nx=True, ex=ROOM_CHARGE_ALERT_GAP):
+		return {"sent": False, "reason": "throttled"}
+	f = frappe.db.get_value("Folio", folio, ["property", "guest", "balance"], as_dict=True)
+	res = frappe.db.get_value("Reservation", reservation, ["guest", "guest_name"], as_dict=True)
+	if not (f and res):
+		return {"sent": False, "reason": "gone"}
+	guest = f.guest or res.guest
+	phone = frappe.db.get_value("Guest", guest, "phone") if guest else None
+	if not phone:
+		return {"sent": False, "reason": "guest_has_no_phone"}
+	conn = _conn(f.property)
+	if not (conn and conn.get("tpl_room_charge")):
+		return {"sent": False, "reason": "no_template_configured"}
+	from kamra.localization import pack_for
+	symbol = pack_for(f.property).locale(
+		frappe.get_cached_doc("Property", f.property)).get("currency_symbol", "")
+	return send_template(
+		f.property, phone, conn.tpl_room_charge,
+		[res.guest_name or "Guest", f"{symbol}{float(amount):,.2f}",
+		 (description or "")[:120], f"{symbol}{float(f.balance or 0):,.2f}"],
+		guest=guest, reservation=reservation)
+
+
 @frappe.whitelist()
 def send_payment_request(reservation: str, amount, note: str = "") -> dict:
 	"""Desk-triggered: ask the guest for an advance/balance over WhatsApp.
 
 	Template args: {{1}} guest name  {{2}} amount  {{3}} note/link.
 	"""
-	from kamra.authz import require_roles  # noqa: F401  (role gate below)
+	from kamra.authz import assert_record_access
 
 	frappe.only_for(("Front Desk", "Finance", "Hotel Admin",
 	                 "System Manager", "Administrator"))
+	assert_record_access("Reservation", reservation)
 	res = frappe.get_doc("Reservation", reservation)
 	conn = _conn(res.property)
 	if not conn or not conn.get("tpl_payment_request"):
@@ -199,10 +286,86 @@ def send_payment_request(reservation: str, amount, note: str = "") -> dict:
 	phone = frappe.db.get_value("Guest", res.guest, "phone")
 	if not phone:
 		frappe.throw("This guest has no phone number on file.")
-	return send_template(
+	link = None if note else _payment_link(res, amount)
+	out = send_template(
 		res.property, phone, conn.tpl_payment_request,
-		[res.guest_name or "Guest", str(amount), note or "at the front desk"],
+		[res.guest_name or "Guest", str(amount), note or link or "at the front desk"],
 		guest=res.guest, reservation=res.name)
+	if link:
+		out["payment_link"] = link
+	return out
+
+
+def _payment_link(res, amount) -> str | None:
+	"""A pay-online link for the guest's open bill, so the message carries
+	it without the desk copying one in. None where the property has no
+	payment gateway (the guest is asked to pay at the desk instead)."""
+	folio = frappe.db.get_value("Folio", {"reservation": res.name, "folio_type": "Guest",
+	                                      "status": "Open"}, "name")
+	if not folio:
+		return None
+	# a test-mode gateway makes a fake link a guest cannot pay
+	if frappe.db.get_value("Payment Gateway Settings",
+	                       {"property": res.property, "enabled": 1}, "test_mode"):
+		return None
+	try:
+		from kamra.payments import create_payment_link
+		return (create_payment_link(folio, amount) or {}).get("url")
+	except frappe.ValidationError:
+		# no gateway here: the guest is asked to pay at the desk
+		frappe.clear_messages()
+		return None
+	except Exception:
+		# the gateway is down: the message still goes, with the desk wording
+		frappe.log_error(title="WhatsApp payment link failed")
+		frappe.clear_messages()
+		return None
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Front Desk", "Hotel Admin", "Kamra Agent", scope={"guest": "Guest"})
+def send_marketing(property: str, guest: str, template: str, args=None) -> dict:
+	"""A promotional template to one guest, refused without their consent."""
+	if isinstance(args, str):
+		args = frappe.parse_json(args)
+	phone = frappe.db.get_value("Guest", guest, "phone")
+	if not phone:
+		frappe.throw(_("This guest has no phone number on file."))
+	out = send_template(property, phone, template, args or [], guest=guest, marketing=True)
+	if out.get("reason") == "no_marketing_consent":
+		frappe.throw(_("This guest has not agreed to marketing messages."),
+		             frappe.PermissionError)
+	return out
+
+
+# Whole-message reply keywords and the language to confirm in
+OPT_OUT_WORDS = {"stop": "en", "unsubscribe": "en", "baja": "es", "alto": "es",
+                 "إلغاء": "ar", "الغاء": "ar", "توقف": "ar", "parar": "pt", "sair": "pt"}
+OPT_IN_WORDS = {"start": "en"}
+
+
+def _consent_keyword(conn, number: str, text: str) -> bool:
+	"""STOP-style replies withdraw marketing consent, START grants it. The
+	guest gets one confirmation when it changed. True = it was a keyword."""
+	from kamra.privacy import set_marketing_consent
+
+	word = " ".join(text.split()).strip(".!¡?¿ ").casefold()
+	lang = OPT_IN_WORDS.get(word) or OPT_OUT_WORDS.get(word)
+	if not lang:
+		return False
+	opt_in = word in OPT_IN_WORDS
+	bare = number.lstrip("+")
+	changed = [g for g in frappe.get_all("Guest", pluck="name",
+	                                     filters={"phone": ("in", [bare, f"+{bare}"])})
+	           if set_marketing_consent(g, opt_in, "WhatsApp Keyword", conn.property)]
+	if changed:
+		hotel = frappe.db.get_value("Property", conn.property, "property_name") or conn.property
+		msg = _("You will get offers from {0} on WhatsApp. Reply STOP at any time to opt out.",
+		        lang=lang) if opt_in else _(
+			"You will no longer get offers from {0}. Booking and stay messages continue. "
+			"Reply START to opt in again.", lang=lang)
+		send_text(conn.property, number, msg.format(hotel), guest=changed[0])
+	return True
 
 
 # ---------------------------------------------------------------------------
@@ -233,19 +396,45 @@ def webhook(**kwargs):
 				secret = frappe.get_doc(
 					"Channel Provider Connection", name
 				).get_password("webhook_secret", raise_exception=False)
-				if secret and secret == token:
+				if secret and hmac.compare_digest(secret, token):
 					return Response(challenge, status=200)
 		return Response("verify token mismatch", status=403)
 
+	raw = frappe.request.data or b"{}"
 	body = {}
 	try:
-		body = json.loads(frappe.request.data or b"{}")
+		body = json.loads(raw)
 	except Exception:
 		pass  # malformed webhook JSON: acknowledge and skip handling
+	signature = frappe.get_request_header("X-Hub-Signature-256") or ""
 	for entry in body.get("entry") or []:
 		for change in entry.get("changes") or []:
-			_handle_inbound((change.get("value") or {}))
+			value = change.get("value") or {}
+			if _signed_by_meta(value, raw, signature):
+				_handle_inbound(value)
 	return {"ok": True}
+
+
+def _signed_by_meta(value: dict, raw: bytes, signature: str) -> bool:
+	"""Meta signs the raw body with the app secret (X-Hub-Signature-256:
+	sha256=<hex>). Checked against the connection the message is addressed
+	to; a connection without an app secret accepts nothing."""
+	phone_id = ((value.get("metadata") or {}).get("phone_number_id") or "")
+	conn_name = phone_id and frappe.db.get_value(
+		"Channel Provider Connection",
+		{"external_account_id": phone_id, "channel": "WhatsApp",
+		 "provider": "Meta Business", "active": 1})
+	if not conn_name:
+		return False
+	secret = frappe.get_doc("Channel Provider Connection", conn_name) \
+		.get_password("app_secret", raise_exception=False)
+	expected = "sha256=" + hmac.new((secret or "").encode(), raw,
+	                                hashlib.sha256).hexdigest()
+	if not secret or not hmac.compare_digest(signature, expected):
+		frappe.log_error(title="WhatsApp webhook signature rejected",
+		                 message=f"connection={conn_name}")
+		return False
+	return True
 
 
 def _handle_inbound(value: dict) -> None:
@@ -275,6 +464,8 @@ def _handle_inbound(value: dict) -> None:
 		_log(conn.property, conn, "Inbound", conn.phone_number, from_number,
 		     "Text", text, guest=guest, reservation=reservation,
 		     status="Received", meta_message_id=msg.get("id"))
+		if _consent_keyword(conn, from_number, text):
+			continue  # an opt-out or opt-in, not a service request
 		if reservation and text:
 			# in-house guest wrote in - put it on the desk's queue
 			frappe.get_doc({
@@ -286,6 +477,7 @@ def _handle_inbound(value: dict) -> None:
 				"category": "Front Desk",
 				"priority": "Medium",
 				"reservation": reservation,
+				"source": "WhatsApp",
 			}).insert(ignore_permissions=True)
 
 

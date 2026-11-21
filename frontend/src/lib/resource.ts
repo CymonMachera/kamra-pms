@@ -58,31 +58,4 @@ export async function deleteResource(doctype: string, name: string) {
   )
 }
 
-export function serverError(e: unknown): string {
-  const body = (e as { body?: string }).body
-  if (body) {
-    try {
-      const parsed = JSON.parse(body)
-      const msgs = JSON.parse(parsed._server_messages ?? "[]")
-      if (msgs.length) {
-        const first = JSON.parse(msgs[0])
-        return String(first.message).replace(/<[^>]+>/g, "")
-      }
-      if (parsed.exception) return String(parsed.exception).split(":").pop()!
-    } catch {
-      /* ignore */
-    }
-  }
-  // no readable server message: translate, never show debug internals
-  if ((e as { network?: boolean }).network) return (e as Error).message
-  const status = (e as { status?: number }).status
-  if (status === 401 || status === 403)
-    return "You don't have permission for that, or your session ended — sign in again if this persists."
-  if (status === 404) return "That record wasn't found — it may have been removed."
-  if (status === 429) return "Too many requests — give it a few seconds and try again."
-  if (status && status >= 500)
-    return "Something went wrong on the server. Try again in a moment."
-  if (status) return "That didn't go through. Please try again."
-  console.warn("[kamra] unexpected error", e)
-  return "Something unexpected went wrong. Try again — if it keeps happening, let your admin know."
-}
+export { serverError } from "./api"

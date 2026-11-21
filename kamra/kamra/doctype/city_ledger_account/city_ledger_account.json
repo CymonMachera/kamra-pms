@@ -7,10 +7,16 @@
   "property",
   "company",
   "account_number",
+  "billing_address",
   "column_break_a",
   "credit_limit",
+  "use_default_credit_days",
+  "credit_days",
   "balance",
-  "disabled"
+  "disabled",
+  "restricted",
+  "restricted_reason",
+  "idempotency_key"
  ],
  "fields": [
   {
@@ -25,7 +31,7 @@
    "fieldname": "company",
    "fieldtype": "Link",
    "label": "Company",
-   "options": "Company",
+   "options": "Corporate Account",
    "reqd": 1,
    "in_list_view": 1
   },
@@ -36,6 +42,12 @@
    "in_list_view": 1
   },
   {
+   "fieldname": "billing_address",
+   "fieldtype": "Small Text",
+   "label": "Billing Address",
+   "description": "Printed on statements and invoices raised on the account."
+  },
+  {
    "fieldname": "column_break_a",
    "fieldtype": "Column Break"
   },
@@ -44,6 +56,21 @@
    "fieldtype": "Currency",
    "label": "Credit Limit",
    "default": "0"
+  },
+  {
+   "fieldname": "use_default_credit_days",
+   "fieldtype": "Check",
+   "label": "Use Property Default Credit Days",
+   "default": "1",
+   "description": "On: bills are due after the property's default payment terms (Settings, Finance). Off: Credit Days below applies as entered - 0 means due on the invoice date."
+  },
+  {
+   "fieldname": "credit_days",
+   "fieldtype": "Int",
+   "label": "Credit Days",
+   "default": "0",
+   "description": "Payment terms when 'Use property default' is off: days after the invoice date a bill is due (0 = due on the invoice date).",
+   "depends_on": "eval:!doc.use_default_credit_days"
   },
   {
    "fieldname": "balance",
@@ -58,11 +85,34 @@
    "fieldtype": "Check",
    "label": "Disabled",
    "default": "0"
+  },
+  {
+   "fieldname": "restricted",
+   "fieldtype": "Check",
+   "label": "Restricted",
+   "default": "0",
+   "description": "No new bills on the account (checkout transfers follow credit control; invoices and transfers are refused). Payments still post."
+  },
+  {
+   "fieldname": "restricted_reason",
+   "fieldtype": "Data",
+   "label": "Restricted Reason",
+   "depends_on": "restricted"
+  },
+  {
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "hidden": 1,
+   "no_copy": 1,
+   "read_only": 1,
+   "search_index": 1,
+   "description": "The key the account was opened with: a retried open returns it."
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-09-07 00:00:00",
+ "modified": "2026-11-12 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Kamra",
  "name": "City Ledger Account",
@@ -83,20 +133,14 @@
   {
    "role": "Hotel Admin",
    "read": 1,
-   "write": 1,
-   "create": 1,
-   "delete": 1,
    "export": 1,
    "print": 1,
    "report": 1,
-   "share": 1,
    "email": 1
   },
   {
    "role": "Finance",
    "read": 1,
-   "write": 1,
-   "create": 1,
    "export": 1,
    "print": 1,
    "report": 1,
@@ -105,8 +149,6 @@
   {
    "role": "Front Desk",
    "read": 1,
-   "write": 1,
-   "create": 1,
    "print": 1,
    "report": 1,
    "email": 1
@@ -114,11 +156,15 @@
   {
    "role": "Kamra Agent",
    "read": 1,
-   "write": 1,
-   "create": 1,
    "print": 1,
    "report": 1,
    "email": 1
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "print": 1,
+   "role": "Night Auditor"
   }
  ],
  "sort_field": "modified",

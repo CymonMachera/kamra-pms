@@ -1,17 +1,20 @@
 import { useCallback, useEffect, useState } from "react"
 import {
   BedDouble,
+  Check,
+  ChevronRight,
   LogIn,
   LogOut,
   Users,
   Wallet,
   ListChecks,
   PieChart,
+  SlidersHorizontal,
+  X,
 } from "lucide-react"
-import { useNavigate, useOutletContext } from "react-router-dom"
+import { Link, useNavigate, useLocation, useOutletContext } from "react-router-dom"
 import {
   call,
-  checkOut,
   getCurrentProperty,
   getSnapshot,
   setHousekeepingStatus,
@@ -33,16 +36,31 @@ import { RoomMediaButton } from "../components/HkMedia"
 import { cn } from "../lib/utils"
 import type { ShellContext } from "../AppShell"
 import CheckInDialog from "../components/CheckInDialog"
+import NoShowDialog from "../components/NoShowDialog"
+import BookingRequests from "../components/BookingRequests"
 import { serverError } from "../lib/resource"
-import { toFullPath } from "../lib/routing"
 import { cur, moneyLocale } from "../lib/money"
-import { useT } from "../lib/i18n"
+import { useT, t as translate, uiDateLocale } from "../lib/i18n"
+import CheckOutDialog from "../components/CheckOutDialog"
+import RoomDrawer, { type RoomTab } from "../components/RoomDrawer"
+import RoomChangeDialog from "../components/RoomChangeDialog"
+import CustomizeToday from "../components/CustomizeToday"
+import OpenTasksCard from "../components/OpenTasksCard"
+import {
+  cachedLayout,
+  DEFAULT_TODAY_LAYOUT,
+  getTodayLayout,
+  type TodayLayout,
+  type TodayLayoutInfo,
+  type WidgetId,
+} from "../lib/rooms"
 
-const HK_CYCLE: RoomRow["housekeeping_status"][] = [
-  "Dirty",
-  "Clean",
-  "Inspected",
-  "Out of Order",
+// the menu's status buttons, in the board's colours and workflow order
+const HK_CHOICES: { status: RoomRow["housekeeping_status"]; label: string; tone: string }[] = [
+  { status: "Dirty", label: "Dirty", tone: "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100" },
+  { status: "Clean", label: "Clean", tone: "border-emerald-300 bg-emerald-50 text-emerald-900 hover:bg-emerald-100" },
+  { status: "Inspected", label: "Inspected", tone: "border-sky-300 bg-sky-50 text-sky-900 hover:bg-sky-100" },
+  { status: "Out of Order", label: "Out of order", tone: "border-rose-300 bg-rose-50 text-rose-900 hover:bg-rose-100" },
 ]
 
 const hkTone: Record<RoomRow["housekeeping_status"], string> = {
@@ -54,6 +72,131 @@ const hkTone: Record<RoomRow["housekeeping_status"], string> = {
 
 const inr0 = (n: number) =>
   Number(n).toLocaleString(moneyLocale(), { maximumFractionDigits: 0 })
+
+/** Group rooms held but not picked up: a lighter step of the brand ramp. */
+const HELD_SHADE = "color-mix(in oklab, var(--color-brand-600) 35%, var(--color-brand-50))"
+
+/** One night on the books: kamra.dashboards.occupancy_forecast. */
+interface ForecastDay {
+  date: string
+  booked: number
+  /** group block rooms not yet picked up (released blocks left out) */
+  held: number
+  available: number
+  occupancy_pct: number
+  occupancy_with_holds_pct: number
+}
+
+/** The next 90 nights as a heat strip (one cell a night, darker = fuller),
+ * with 30/60/90 day averages and a weekly table for screen readers. Rooms
+ * only: the desk sees it, so no money. */
+function OccupancyForecast({ days }: { days: ForecastDay[] }) {
+  const { t } = useT()
+  const fmt = (d: string, o: Intl.DateTimeFormatOptions) =>
+    new Date(d + "T00:00:00").toLocaleDateString(uiDateLocale(undefined), o)
+  const avg = (xs: ForecastDay[]) => {
+    const rooms = xs.reduce((a, x) => a + x.booked + x.held + x.available, 0)
+    return rooms ? Math.round((100 * xs.reduce((a, x) => a + x.booked, 0)) / rooms) : 0
+  }
+  const spans = [30, 60, 90].map((n) => ({ n, pct: avg(days.slice(0, n)) }))
+  const weeks = Array.from({ length: Math.ceil(days.length / 7) }, (_, i) =>
+    days.slice(i * 7, i * 7 + 7),
+  )
+  // sequential, one hue: the brand ramp from its light end to its dark end
+  // (both flip with the theme, so the fuller night always has more contrast)
+  const fill = (pct: number) =>
+    `color-mix(in oklab, var(--color-brand-700) ${Math.max(6, Math.min(100, pct))}%, var(--color-brand-50))`
+  // booked fills from the bottom; group holds sit on top in a lighter shade
+  const stack = (d: ForecastDay) => {
+    const b = d.occupancy_pct
+    const h = d.occupancy_with_holds_pct
+    return `linear-gradient(to top, ${fill(b)} ${b}%, ${HELD_SHADE} ${b}% ${h}%, var(--color-brand-50) ${h}%)`
+  }
+  const cols = { gridTemplateColumns: `repeat(${days.length}, minmax(0, 1fr))` }
+  const summary = spans.map((s) => t("{n} days {pct}%", s)).join(", ")
+  return (
+    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2.5">
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <div className="text-xs font-medium text-zinc-700">
+          {t("Occupancy on the books, next 90 days")}
+        </div>
+        <div className="flex gap-3 text-[11px] text-zinc-500">
+          {spans.map((s) => (
+            <span key={s.n}>
+              {t("{n} days", { n: s.n })}{" "}
+              <span className="font-semibold tabular-nums text-zinc-900">{s.pct}%</span>
+            </span>
+          ))}
+        </div>
+      </div>
+      <div
+        role="img"
+        aria-label={t("Occupancy on the books: {summary}", { summary })}
+        className="grid gap-px"
+        style={cols}
+      >
+        {days.map((d) => (
+          <div
+            key={d.date}
+            className="h-6 rounded-[2px]"
+            style={{ background: stack(d) }}
+            title={t(
+              "{date}: {booked} booked, {held} held for groups, of {total} rooms ({pct}%, {pctHolds}% with holds)",
+              {
+                date: fmt(d.date, { weekday: "short", day: "numeric", month: "short" }),
+                booked: d.booked,
+                held: d.held,
+                total: d.booked + d.held + d.available,
+                pct: Math.round(d.occupancy_pct),
+                pctHolds: Math.round(d.occupancy_with_holds_pct),
+              },
+            )}
+          />
+        ))}
+      </div>
+      <div aria-hidden className="mt-1 grid text-[10px] text-zinc-400" style={cols}>
+        {days.map((d, i) => (
+          <div key={d.date} className="whitespace-nowrap">
+            {i === 0 || d.date.endsWith("-01") ? fmt(d.date, { month: "short" }) : ""}
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 flex gap-3 text-[10px] text-zinc-500">
+        <span className="flex items-center gap-1">
+          <span aria-hidden className="size-2 rounded-[2px] bg-brand-700" />
+          {t("Booked")}
+        </span>
+        <span className="flex items-center gap-1">
+          <span aria-hidden className="size-2 rounded-[2px]" style={{ background: HELD_SHADE }} />
+          {t("Held for groups")}
+        </span>
+      </div>
+      <details className="mt-1 text-[11px] text-zinc-500">
+        <summary className="cursor-pointer select-none">{t("By week")}</summary>
+        <table className="mt-1 w-full tabular-nums">
+          <thead>
+            <tr className="text-zinc-400">
+              <th className="py-0.5 text-start font-medium">{t("Week of")}</th>
+              <th className="py-0.5 text-end font-medium">{t("Room nights booked")}</th>
+              <th className="py-0.5 text-end font-medium">{t("Held for groups")}</th>
+              <th className="py-0.5 text-end font-medium">{t("Occ %")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {weeks.map((w) => (
+              <tr key={w[0].date} className="text-zinc-700">
+                <td className="py-0.5">{fmt(w[0].date, { day: "numeric", month: "short" })}</td>
+                <td className="py-0.5 text-end">{w.reduce((a, x) => a + x.booked, 0)}</td>
+                <td className="py-0.5 text-end">{w.reduce((a, x) => a + x.held, 0)}</td>
+                <td className="py-0.5 text-end">{avg(w)}%</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </details>
+    </div>
+  )
+}
 
 /** Paid / due / unpaid at a glance - the folio is the source of truth,
  * this chip just saves the trip to Billing. */
@@ -97,7 +240,7 @@ function ReservationList(props: {
 }) {
   const { t } = useT()
   if (props.rows.length === 0) {
-    return <p className="px-1 py-3 text-sm text-zinc-400">{props.empty}</p>
+    return <p className="px-1 py-3 text-sm text-zinc-400">{translate(props.empty)}</p>
   }
   return (
     <ul className="divide-y divide-zinc-100">
@@ -120,32 +263,32 @@ function ReservationList(props: {
                 : t("Unassigned")}{" "}
               · {t("{n} night{s}", { n: row.nights, s: row.nights === 1 ? "" : "s" })} ·{" "}
               {t("{n} ad", { n: row.adults })}
-              {row.children ? ` + ${row.children} ch` : ""}
-              {row.eta && ` · ETA ${row.eta}`}
+              {row.children ? translate(" + {v0} ch", { v0: String(row.children) }) : ""}
+              {row.eta && translate(" · ETA {v0}", { v0: String(row.eta) })}
               {row.booked_by_name && (
                 <span
                   title={
-                    (row.booked_by_phone
+                    ((row.booked_by_phone
                       ? `${row.booked_by_phone} · `
                       : "") +
                     t("send links & updates to: {pref}", {
-                      pref: row.contact_preference ?? "Booker",
-                    })
+                      pref: translate(row.contact_preference ?? "Booker"),
+                    }))
                   }
                 >
                   {" "}
                   · {t("via {name}", { name: row.booked_by_name })}
-                  {row.booker_relation ? ` (${row.booker_relation})` : ""}
+                  {row.booker_relation ? ` (${translate(row.booker_relation)})` : ""}
                 </span>
               )}
               {row.status === "Confirmed" && (
-                <a
-                  href={toFullPath(`/grc/${encodeURIComponent(row.name)}`)}
+                <Link
+                  to={`/grc/${encodeURIComponent(row.name)}`}
                   className="ml-2 font-medium text-brand-700 hover:underline"
                   onClick={(e) => e.stopPropagation()}
                 >
                   {t("GRC")}
-                </a>
+                </Link>
               )}
               {row.status === "Confirmed" &&
                 row.precheckin_status !== "Submitted" &&
@@ -159,7 +302,7 @@ function ReservationList(props: {
                       )
                     }}
                     title={
-                      row.contact_preference === "Booker" && row.booked_by_name
+                      (row.contact_preference === "Booker" && row.booked_by_name
                         ? t("Copy the self check-in link - send to the booker, {name}{phone}", {
                             name: row.booked_by_name,
                             phone: row.booked_by_phone ? ` (${row.booked_by_phone})` : "",
@@ -168,7 +311,7 @@ function ReservationList(props: {
                           ? t("Copy the self check-in link - send to the guest and the booker ({name})", {
                               name: row.booked_by_name,
                             })
-                          : t("Copy the self check-in link - send to the guest")
+                          : t("Copy the self check-in link - send to the guest"))
                     }
                   >
                     {t("copy check-in link")}
@@ -183,9 +326,21 @@ function ReservationList(props: {
   )
 }
 
-function ordinalFloor(f: string, t: (s: string, vars?: Record<string, string | number>) => string) {
+// Rooms saved without a floor still need a row on the board, or they
+// silently vanish from Today. They group under this key.
+const NO_FLOOR = "__none__"
+
+function ordinalFloor(
+  f: string,
+  t: (s: string, vars?: Record<string, string | number>) => string,
+  lang: string,
+) {
+  if (f === NO_FLOOR) return t("Unassigned floor")
   const n = Number(f)
-  if (Number.isNaN(n)) return t("{f} Floor", { f })
+  // a named floor ("Garden wing", "Mezzanine") shows as the hotel wrote it
+  if (Number.isNaN(n)) return f
+  // English ordinals ("1st") only read right in English
+  if (!lang.startsWith("en")) return t("{n} Floor", { n })
   const s = ["th", "st", "nd", "rd"]
   const v = n % 100
   return t("{n}{ord} Floor", { n, ord: s[(v - 20) % 10] || s[v] || s[0] })
@@ -222,16 +377,50 @@ function InHouseTable({
     )
   }
   return (
-    <div className="overflow-x-auto">
+    <>
+    {/* phones: one card per guest, nothing to scroll sideways */}
+    <ul className="divide-y divide-zinc-100 sm:hidden">
+      {rows.map((row) => {
+        const due = Number(row.balance_due ?? 0)
+        return (
+          <li key={row.name}>
+            <button
+              type="button"
+              onClick={() => navigate(`/grc/${row.name}`)}
+              className="flex w-full items-center gap-3 py-3 text-start"
+            >
+              <Avatar name={row.guest_name} />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-medium text-zinc-800">{row.guest_name}</span>
+                <span className="block text-xs text-zinc-500">
+                  {row.room ? t("Room {room}", { room: row.room.split("-").pop() ?? "" }) : t("No room yet")}
+                  {" · "}
+                  {t("Leaves {when}", { when: relDay(row.check_out_date, t, today) })}
+                </span>
+              </span>
+              {due > 0 ? (
+                <span className="shrink-0 tabular-nums text-sm text-amber-700">
+                  {cur()}
+                  {inr0(due)} {t("Due")}
+                </span>
+              ) : (
+                <span className="shrink-0 tabular-nums text-sm text-zinc-400">{cur()}0</span>
+              )}
+            </button>
+          </li>
+        )
+      })}
+    </ul>
+    <div className="hidden overflow-x-auto sm:block">
       <table className="w-full min-w-[560px] text-sm">
         <thead>
-          <tr className="text-left text-[11px] font-medium uppercase tracking-wider text-zinc-400">
-            <th className="pb-2 pl-1 font-medium">{t("Guest")}</th>
+          <tr className="text-start text-[11px] font-medium uppercase tracking-wider text-zinc-400">
+            <th className="pb-2 ps-1 font-medium">{t("Guest")}</th>
             <th className="pb-2 font-medium">{t("Room")}</th>
             <th className="pb-2 font-medium">{t("Source")}</th>
             <th className="pb-2 font-medium">{t("Balance")}</th>
             <th className="pb-2 font-medium">{t("Stay")}</th>
-            <th className="pb-2 pr-1 text-right font-medium">{t("Check-out")}</th>
+            <th className="pb-2 pe-1 text-end font-medium">{t("Check-out")}</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-zinc-100">
@@ -243,7 +432,7 @@ function InHouseTable({
                 onClick={() => navigate(`/grc/${row.name}`)}
                 className="cursor-pointer hover:bg-zinc-50/70"
               >
-                <td className="py-2.5 pl-1">
+                <td className="py-2.5 ps-1">
                   <div className="flex items-center gap-2.5">
                     <Avatar name={row.guest_name} />
                     <span className="font-medium text-zinc-800">
@@ -252,7 +441,7 @@ function InHouseTable({
                   </div>
                 </td>
                 <td className="py-2.5 tabular-nums text-zinc-600">
-                  {row.room ? row.room.split("-").pop() : "—"}
+                  {row.room ? row.room.split("-").pop() : t("No room yet")}
                 </td>
                 <td className="py-2.5">
                   <SourceBadge row={row} />
@@ -272,7 +461,7 @@ function InHouseTable({
                   {t("{n} night{s}", { n: row.nights, s: row.nights === 1 ? "" : "s" })} ·{" "}
                   {t("{n} adult{s}", { n: row.adults, s: row.adults === 1 ? "" : "s" })}
                 </td>
-                <td className="py-2.5 pr-1 text-right">
+                <td className="py-2.5 pe-1 text-end">
                   <div className="tabular-nums text-zinc-600">
                     {row.check_out_date}
                   </div>
@@ -286,20 +475,43 @@ function InHouseTable({
         </tbody>
       </table>
     </div>
+    </>
   )
 }
 
 export default function Today() {
-  const { t } = useT()
+  const { t, lang } = useT()
   const { refreshKey } = useOutletContext<ShellContext>()
   const navigate = useNavigate()
   const [snap, setSnap] = useState<Snapshot | null>(null)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [kpi, setKpi] = useState<any>(null)
+  // revenue and occupancy only when the server sent them (it leaves them
+  // out for the front desk: kamra.dashboards.FIGURE_ROLES)
+  const figures = !!kpi && !kpi.figures_hidden
   const [busy, setBusy] = useState<string | null>(null)
   const [checkingIn, setCheckingIn] = useState<string | null>(null)
+  const [markingNoShow, setMarkingNoShow] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [floor, setFloor] = useState("All")
+  // the widget layout: last one seen paints first, the server copy wins
+  const [layout, setLayout] = useState<TodayLayout>(
+    () => cachedLayout() ?? DEFAULT_TODAY_LAYOUT,
+  )
+  const [layoutInfo, setLayoutInfo] = useState<TodayLayoutInfo | null>(null)
+  const [customizing, setCustomizing] = useState(false)
+  useEffect(() => {
+    getTodayLayout()
+      .then((info) => {
+        if (info && info.layout) {
+          setLayoutInfo(info)
+          setLayout(info.layout)
+        }
+      })
+      .catch(() => {
+        /* keep the cached / built-in layout */
+      })
+  }, [])
 
   const refresh = useCallback(async () => {
     try {
@@ -319,9 +531,53 @@ export default function Today() {
 
   useEffect(() => {
     refresh()
-    const t = setInterval(refresh, 30_000)
-    return () => clearInterval(t)
+    // 60s when the tab is visible; pause entirely when hidden so hotel
+    // Wi‑Fi is not burned by background polls (was 30s always-on).
+    let id: ReturnType<typeof setInterval> | null = null
+    const arm = () => {
+      if (id) clearInterval(id)
+      id = null
+      if (document.visibilityState === "hidden") return
+      id = setInterval(refresh, 60_000)
+    }
+    const onVis = () => {
+      arm()
+      if (document.visibilityState === "visible") void refresh()
+    }
+    arm()
+    document.addEventListener("visibilitychange", onVis)
+    return () => {
+      if (id) clearInterval(id)
+      document.removeEventListener("visibilitychange", onVis)
+    }
   }, [refresh, refreshKey])
+
+  // other screens (tape chart, command palette, a group companion) open
+  // the check-out sheet here with navigate("/", { state: { checkout } })
+  const location = useLocation()
+  const [checkingOut, setCheckingOut] = useState<string | null>(null)
+  const [roomMenu, setRoomMenu] = useState<string | null>(null)
+  // Out of order takes a room off sale: the first tap asks, the second sets it
+  const [confirmOoo, setConfirmOoo] = useState(false)
+  useEffect(() => {
+    setConfirmOoo(false)
+    if (!roomMenu) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setRoomMenu(null) }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [roomMenu])
+  // the room panel from the Rooms screen, opened over Today
+  const [roomPanel, setRoomPanel] = useState<{ room: string; tab?: RoomTab } | null>(null)
+  const [moving, setMoving] = useState<{ res: string; number: string } | null>(null)
+  const [panelKey, setPanelKey] = useState(0)
+  useEffect(() => {
+    const res = (location.state as { checkout?: string } | null)?.checkout
+    if (res) {
+      setCheckingOut(res)
+      // a reload must not reopen it
+      navigate(".", { replace: true, state: null })
+    }
+  }, [location.state, navigate])
 
   async function act(key: string, fn: () => Promise<unknown>) {
     setBusy(key)
@@ -335,53 +591,63 @@ export default function Today() {
     }
   }
 
-  const occupied = snap?.rooms.filter(
-    (r) => r.occupancy_status === "Occupied",
-  ).length
-  const occupancyPct = snap?.rooms.length
-    ? Math.round(((occupied ?? 0) / snap.rooms.length) * 100)
-    : 0
+  // occupied over sellable rooms (out of order left out), from the server;
+  // the room snapshot until it answers
+  const occNow = kpi?.occupancy_now
+  const occupied = occNow
+    ? Number(occNow.occupied)
+    : snap?.rooms.filter((r) => r.occupancy_status === "Occupied").length
+  const sellableN = occNow ? Number(occNow.sellable) : (snap?.rooms.length ?? 0)
+  const occupancyPct = sellableN ? Math.round(((occupied ?? 0) / sellableN) * 100) : 0
   const arrivalsN = snap?.arrivals.length ?? 0
   const departuresN = snap?.departures.length ?? 0
   const inhouseN = snap?.in_house.length ?? 0
-  const roomsN = snap?.rooms.length ?? 0
   const revenue = Number(kpi?.revenue_today ?? 0)
-  const revpar = Number(kpi?.statistics?.revpar ?? 0)
+  // Today's RevPAR (room revenue / rooms). MTD lives on statistics.revpar.
+  const revpar = Number(kpi?.revpar ?? kpi?.statistics?.revpar ?? 0)
+  const roomRevenueToday = Number(kpi?.room_revenue_today ?? 0)
   const tasksN = Number(kpi?.housekeeping?.open_tasks ?? 0)
   const overdueN = Number(kpi?.housekeeping?.overdue_tasks ?? 0)
   const allRooms = snap?.rooms ?? []
-  const floors = Array.from(
-    new Set(allRooms.map((r) => r.floor).filter(Boolean)),
-  ).sort() as string[]
+  const floorOf = (r: RoomRow) => (r.floor || "").trim() || NO_FLOOR
+  const floors = Array.from(new Set(allRooms.map(floorOf))).sort((a, b) =>
+    a === NO_FLOOR ? 1 : b === NO_FLOOR ? -1 : a.localeCompare(b, undefined, { numeric: true }),
+  )
   const shownFloors = floor === "All" ? floors : [floor]
   const renderRoom = (room: RoomRow) => {
-    const next =
-      HK_CYCLE[
-        (HK_CYCLE.indexOf(room.housekeeping_status) + 1) % HK_CYCLE.length
-      ]
     const occupied = room.occupancy_status === "Occupied"
     const stay = occupied
       ? (snap?.in_house ?? []).find((r) => r.room === room.name)
       : undefined
+    // a guest due in today who already has this room: the tile checks them in
+    const arriving = !occupied
+      ? (snap?.arrivals ?? []).find((r) => r.room === room.name)
+      : undefined
+    const item = "flex w-full items-center px-3 py-2.5 text-start hover:bg-zinc-50"
+    const openRoom = (tab?: RoomTab) => {
+      setRoomMenu(null)
+      setRoomPanel({ room: room.name, tab })
+    }
     return (
       <div key={room.name} className="relative">
         <button
           title={
-            stay
-              ? t("{guest} · open registration", { guest: stay.guest_name })
-              : t("Housekeeping: {from} → {to} (click to advance)", {
-                  from: room.housekeeping_status,
-                  to: next,
-                })
+            (stay
+              ? t("{guest} · check out or open registration", { guest: stay.guest_name })
+              : arriving
+                ? t("{guest} arrives today · check in", { guest: arriving.guest_name })
+                : t("Housekeeping: {status} · click to change", {
+                    status: t(room.housekeeping_status),
+                  }))
           }
           disabled={busy === room.name}
-          onClick={() =>
-            stay
-              ? navigate(`/grc/${stay.name}`)
-              : act(room.name, () => setHousekeepingStatus(room.name, next))
-          }
+          aria-haspopup="menu"
+          aria-expanded={roomMenu === room.name}
+          // a click opens the menu, never changes a status by itself: one
+          // stray tap used to mark a room Clean or Out of Order
+          onClick={() => setRoomMenu((m) => (m === room.name ? null : room.name))}
           className={cn(
-            "w-full cursor-pointer rounded-lg border px-2 pb-1.5 pt-2 text-left transition-transform",
+            "w-full cursor-pointer rounded-lg border px-2 pb-1.5 pt-2 text-start transition-transform",
             "hover:-translate-y-0.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600",
             occupied
               ? "border-brand-700 bg-brand-700 text-white"
@@ -391,17 +657,132 @@ export default function Today() {
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold">{room.room_number}</span>
             {occupied && <BedDouble className="size-3.5" aria-hidden />}
+            {arriving && <LogIn className="size-3.5" aria-hidden />}
           </div>
-          <div className="mt-0.5 text-[9px] font-medium uppercase tracking-wide opacity-80">
-            {occupied ? t("Occupied") : t(room.housekeeping_status)}
+          {/* room on the end side for the photo button, so it never covers the label */}
+          <div className="mt-0.5 truncate pe-6 text-[9px] font-medium uppercase tracking-wide opacity-80">
+            {occupied ? t("Occupied") : arriving ? t("Arriving") : t(room.housekeeping_status)}
           </div>
+          {/* ponytail: glance balance; drawer still has full money */}
+          {stay?.balance_due != null && Number(stay.balance_due) > 0 && (
+            <div className="mt-0.5 truncate pe-6 text-[9px] font-semibold tabular-nums">
+              {cur()}
+              {inr0(stay.balance_due)} {t("due")}
+            </div>
+          )}
         </button>
         {(occupied || room.housekeeping_status === "Clean") && (
           <RoomMediaButton room={room.name} />
         )}
+        {roomMenu === room.name && (
+          <>
+            {/* a click anywhere outside closes it; dimmed on a phone */}
+            <div className="fixed inset-0 z-30 bg-zinc-900/30 sm:z-10 sm:bg-transparent"
+              aria-hidden onClick={() => setRoomMenu(null)} />
+            <div
+              role="menu"
+              aria-label={t("Room {n}", { n: room.room_number })}
+              className="fixed inset-x-4 bottom-4 z-40 overflow-hidden rounded-xl border border-zinc-200 bg-white text-base shadow-2xl sm:absolute sm:inset-x-auto sm:bottom-auto sm:start-0 sm:top-full sm:z-20 sm:mt-1 sm:w-64 sm:rounded-lg sm:text-sm sm:shadow-lg"
+            >
+              <div className="flex items-start gap-2 border-b border-zinc-100 px-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold text-zinc-900">{t("Room {n}", { n: room.room_number })}</span>
+                    <span className={cn("rounded-full border px-2 py-0.5 text-[11px] font-medium",
+                      occupied ? "border-brand-700 bg-brand-700 text-white" : hkTone[room.housekeeping_status])}>
+                      {occupied ? t("Occupied") : t(room.housekeeping_status)}
+                    </span>
+                  </div>
+                  {(stay ?? arriving) && (
+                    <p className="mt-0.5 truncate text-xs text-zinc-500">{(stay ?? arriving)!.guest_name}</p>
+                  )}
+                </div>
+                <button className="-me-1 rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                  aria-label={t("Close")} onClick={() => setRoomMenu(null)}>
+                  <X className="size-4" aria-hidden />
+                </button>
+              </div>
+              {stay && (
+                <div className="py-1">
+                  <button role="menuitem" className={cn(item, "font-medium text-zinc-800")}
+                    onClick={() => { setRoomMenu(null); setCheckingOut(stay.name) }}>
+                    {t("Check out")}
+                  </button>
+                  <button role="menuitem" className={cn(item, "text-zinc-700")}
+                    onClick={() => { setRoomMenu(null); navigate(`/reservations/${stay.name}`) }}>
+                    {t("Extend stay")}
+                  </button>
+                  <button role="menuitem" className={cn(item, "text-zinc-700")} onClick={() => openRoom("billing")}>
+                    {t("Folio and billing")}
+                  </button>
+                  <button role="menuitem" className={cn(item, "text-zinc-700")} onClick={() => openRoom("requests")}>
+                    {t("Guest requests")}
+                  </button>
+                  <button role="menuitem" className={cn(item, "text-zinc-700")} onClick={() => navigate(`/grc/${stay.name}`)}>
+                    {t("Registration card")}
+                  </button>
+                </div>
+              )}
+              {arriving && (
+                <div className="py-1">
+                  <button role="menuitem" className={cn(item, "font-medium text-zinc-800")}
+                    onClick={() => { setRoomMenu(null); setCheckingIn(arriving.name) }}>
+                    {t("Check in")}
+                  </button>
+                </div>
+              )}
+              {!occupied && (
+                <div className={cn("px-3 pb-3 pt-2", arriving && "border-t border-zinc-100")}>
+                  <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-zinc-400">
+                    {t("Housekeeping status")}
+                  </p>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {HK_CHOICES.map((c) => {
+                      const current = c.status === room.housekeeping_status
+                      const asking = c.status === "Out of Order" && confirmOoo
+                      return (
+                        <button key={c.status} role="menuitemradio" aria-checked={current}
+                          disabled={current}
+                          className={cn("flex min-h-10 items-center justify-center gap-1 rounded-lg border px-2 text-sm font-medium",
+                            c.tone, current && "cursor-default ring-2 ring-zinc-900/70 ring-offset-1",
+                            asking && "bg-rose-600 text-white hover:bg-rose-700")}
+                          onClick={() => {
+                            if (c.status === "Out of Order" && !confirmOoo) {
+                              setConfirmOoo(true)
+                              return
+                            }
+                            setRoomMenu(null)
+                            void act(room.name, () => setHousekeepingStatus(room.name, c.status))
+                          }}>
+                          {current && <Check className="size-3.5" aria-hidden />}
+                          {asking ? t("Tap again to confirm") : t(c.label)}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+              <button role="menuitem" className={cn(item, "justify-between border-t border-zinc-100 text-zinc-700")}
+                onClick={() => openRoom()}>
+                {t("Room details")}
+                <ChevronRight className="size-4 text-zinc-400 rtl:rotate-180" aria-hidden />
+              </button>
+            </div>
+          </>
+        )}
       </div>
     )
   }
+  // the old Front Desk dashboard's money row, folded into Today
+  const outstanding = Number(kpi?.finance?.outstanding ?? 0)
+  const moneyTiles: { label: string; value: string; to: string; tone?: string }[] = [
+    { label: t("Collected today"), value: `${cur()}${inr0(Number(kpi?.collections_today ?? 0))}`, to: "/cashier/board" },
+    { label: t("Outstanding"), value: `${cur()}${inr0(outstanding)}`, to: "/ledgers", tone: outstanding ? "text-amber-700" : undefined },
+    { label: t("Open folios"), value: String(kpi?.finance?.open_folios ?? 0), to: "/billing" },
+    { label: t("ADR, month to date"), value: `${cur()}${inr0(Number(kpi?.statistics?.adr ?? 0))}`, to: "/dashboard" },
+    { label: t("RevPAR, month to date"), value: `${cur()}${inr0(Number(kpi?.statistics?.revpar ?? 0))}`, to: "/dashboard" },
+    { label: t("Occupancy, month to date"), value: `${kpi?.statistics?.mtd_occupancy_pct ?? 0}%`, to: "/reports/flash" },
+  ]
   const hkRoom = kpi?.housekeeping?.room_status ?? {}
   const hkStats = [
     { label: t("Clean"), value: hkRoom.Clean ?? 0, dot: "bg-emerald-500" },
@@ -417,13 +798,271 @@ export default function Today() {
   const greeting =
     hh < 12 ? t("Good morning") : hh < 17 ? t("Good afternoon") : t("Good evening")
   const prettyDate = snap?.date
-    ? new Date(snap.date + "T00:00:00").toLocaleDateString(undefined, {
+    ? new Date(snap.date + "T00:00:00").toLocaleDateString(uiDateLocale(undefined), {
         weekday: "short",
         day: "numeric",
         month: "short",
         year: "numeric",
       })
     : ""
+
+  // Today is a set of widgets; each person picks which show and in what
+  // order (Customize). The built-in layout is the classic Today.
+  const widgets: Record<WidgetId, React.ReactNode> = {
+    kpis: (
+      <div className="mb-6 space-y-3">
+      <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-3", figures ? "xl:grid-cols-6" : "xl:grid-cols-5")}>
+        <StatCard
+          icon={<LogIn className="size-4" />}
+          label={t("Arrivals")}
+          value={arrivalsN}
+          spark={mkTrend(arrivalsN)}
+          to="/in-house?tab=arrivals"
+        />
+        <StatCard
+          icon={<LogOut className="size-4" />}
+          label={t("Departures")}
+          value={departuresN}
+          spark={mkTrend(departuresN, false)}
+          sparkColor="var(--color-amber-600)"
+          to="/in-house?tab=departures"
+        />
+        <StatCard
+          icon={<Users className="size-4" />}
+          label={t("In-house")}
+          value={inhouseN}
+          spark={mkTrend(inhouseN)}
+          to="/in-house?tab=in-house"
+        />
+        <StatCard
+          icon={<PieChart className="size-4" />}
+          label={t("Occupancy")}
+          to="/room-board"
+          value={`${occupancyPct}%`}
+          progress={occupancyPct}
+          progressLabel={t("{occupied} of {total} rooms", {
+            occupied: occupied ?? 0,
+            total: sellableN,
+          })}
+        />
+        {figures && <StatCard
+          icon={<Wallet className="size-4" />}
+          label={t("Revenue")}
+          value={`${cur()}${inr0(revenue)}`}
+          sub={
+            (roomRevenueToday > 0 || revpar > 0
+              ? t("RevPAR {amount} · room {room}", {
+                  amount: `${cur()}${inr0(revpar)}`,
+                  room: `${cur()}${inr0(roomRevenueToday)}`,
+                  // keep "room ₹18,480" together if the line has to wrap
+                }).replace(/ (\S+)$/, "\u00a0$1")
+              : t("RevPAR {amount} · no room charges posted today", {
+                  amount: `${cur()}${inr0(revpar)}`,
+                }))
+          }
+          spark={mkTrend(revenue)}
+          to="/dashboard"
+        />}
+        <StatCard
+          icon={<ListChecks className="size-4" />}
+          label={t("Open tasks")}
+          value={tasksN}
+          sub={
+            (overdueN
+              ? t("{n} overdue · Housekeeping", { n: overdueN })
+              : t("Housekeeping"))
+          }
+          to={"/housekeeping"}
+        />
+      </div>
+      {kpi && figures && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+          {moneyTiles.map((m) => (
+            <Link
+              key={m.label}
+              to={m.to}
+              className="rounded-lg border border-zinc-200 bg-white px-3 py-2 transition-colors hover:border-brand-300"
+            >
+              <div className="text-[11px] font-medium text-zinc-500">{m.label}</div>
+              <div className={cn("text-sm font-semibold tabular-nums", m.tone ?? "text-zinc-900")}>{m.value}</div>
+            </Link>
+          ))}
+        </div>
+      )}
+      {kpi?.forecast?.length > 0 && <OccupancyForecast days={kpi.forecast} />}
+      </div>
+    ),
+    booking_requests: <BookingRequests refreshKey={refreshKey} onChanged={refresh} />,
+    arrivals: (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("Arrivals")}</CardTitle>
+          <Link to="/in-house?tab=arrivals" className="text-xs font-medium text-brand-700 hover:underline">{t("View all")}</Link>
+        </CardHeader>
+        <CardContent className="pt-1">
+          <ReservationList
+            rows={snap?.arrivals ?? []}
+            empty={t("No arrivals expected today.")}
+            action={(row) => (
+              <span className="flex items-center gap-1">
+                {snap?.business_date && row.check_in_date <= snap.business_date && (
+                  <Button
+                    variant="ghost"
+                    className="text-rose-700"
+                    disabled={busy === row.name}
+                    onClick={() => setMarkingNoShow(row.name)}
+                  >
+                    {t("No-show")}
+                  </Button>
+                )}
+                <Button
+                  disabled={busy === row.name}
+                  onClick={() => setCheckingIn(row.name)}
+                >
+                  {t("Check in")}
+                </Button>
+              </span>
+            )}
+          />
+        </CardContent>
+      </Card>
+    ),
+    departures: (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("Departures")}</CardTitle>
+          <Link to="/in-house?tab=departures" className="text-xs font-medium text-brand-700 hover:underline">{t("View all")}</Link>
+        </CardHeader>
+        <CardContent className="pt-1">
+          <ReservationList
+            rows={snap?.departures ?? []}
+            empty={t("No departures due today.")}
+            action={(row) => (
+              <Button
+                variant="outline"
+                disabled={busy === row.name}
+                onClick={() => setCheckingOut(row.name)}
+              >
+                {t("Check out")}
+              </Button>
+            )}
+          />
+        </CardContent>
+      </Card>
+    ),
+    room_board: (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("Room board")}</CardTitle>
+          <span className="flex min-w-0 items-center gap-3">
+            <span className="hidden truncate text-xs text-zinc-400 sm:inline">
+              {t("Click a room to change its status or open it")}
+            </span>
+            <Link
+              to="/room-board"
+              className="shrink-0 text-sm font-medium text-brand-700 hover:underline"
+            >
+              {t("Open full view")}
+            </Link>
+          </span>
+        </CardHeader>
+        <CardContent>
+          <div className="mb-3 flex flex-wrap gap-1 border-b border-zinc-100">
+            {["All", ...floors].map((f) => (
+              <button
+                key={f}
+                onClick={() => setFloor(f)}
+                className={cn(
+                  "relative px-3 py-1.5 text-sm font-medium",
+                  floor === f
+                    ? "text-brand-700"
+                    : "text-zinc-500 hover:text-zinc-700",
+                )}
+              >
+                {f === "All" ? t("All Floors") : ordinalFloor(f, t, lang)}
+                {floor === f && (
+                  <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-brand-600" />
+                )}
+              </button>
+            ))}
+          </div>
+          <div className="space-y-3">
+            {shownFloors.map((fl) => (
+              <div key={fl} className="flex items-start gap-3">
+                <div className="w-16 shrink-0 pt-2 text-xs font-medium text-zinc-500">
+                  {ordinalFloor(fl, t, lang)}
+                </div>
+                <div className="grid flex-1 grid-cols-[repeat(auto-fill,minmax(6.25rem,1fr))] gap-2">
+                  {allRooms
+                    .filter((r) => floorOf(r) === fl)
+                    .map((room) => renderRoom(room))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2 text-xs text-zinc-500">
+            <Badge tone="green">{t("Clean")}</Badge>
+            <Badge tone="sky">{t("Inspected")}</Badge>
+            <Badge tone="amber">{t("Dirty")}</Badge>
+            <Badge tone="rose">{t("Out of Order")}</Badge>
+            <span className="inline-flex items-center gap-1">
+              <BedDouble className="size-3.5" aria-hidden /> {t("occupied")}
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+    ),
+    in_house: (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("In-house guests")}</CardTitle>
+          <Link to="/in-house?tab=in-house" className="text-xs font-medium text-brand-700 hover:underline">
+            {t("{n} staying", { n: inhouseN })}
+          </Link>
+        </CardHeader>
+        <CardContent className="pt-1">
+          <InHouseTable rows={snap?.in_house ?? []} today={snap?.date} />
+        </CardContent>
+      </Card>
+    ),
+    housekeeping: (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("Housekeeping")}</CardTitle>
+          <span className="text-xs text-zinc-400">
+            {t("{pct}% occupied · {occupied} of {total}", {
+              pct: occupancyPct,
+              occupied: occupied ?? 0,
+              total: sellableN,
+            })}
+          </span>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {hkStats.map((s) => (
+              <Link
+                to="/housekeeping-board"
+                key={s.label}
+                className="flex items-center gap-2 rounded-lg border border-zinc-200 px-3 py-2 hover:border-brand-300"
+              >
+                <span className={cn("size-2 rounded-full", s.dot)} />
+                <span className="text-lg font-semibold tabular-nums">
+                  {s.value}
+                </span>
+                <span className="text-xs text-zinc-500">{translate(s.label)}</span>
+              </Link>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    ),
+    open_tasks: <OpenTasksCard refreshKey={refreshKey} />,
+  }
+  const activeLayout = layout ?? DEFAULT_TODAY_LAYOUT
+  const visible = (ids?: WidgetId[]) => (ids ?? []).filter((id) => !activeLayout.hidden?.includes(id))
+  const top = visible(activeLayout.top)
+  const left = visible(activeLayout.left)
+  const right = visible(activeLayout.right)
 
   return (
     <div>
@@ -436,210 +1075,117 @@ export default function Today() {
             {greeting}. {t("Here's what's happening today.")}
           </p>
         </div>
-        <div className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium tabular-nums text-zinc-600">
-          {prettyDate}
+        <div className="flex items-center gap-2">
+          <div className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium tabular-nums text-zinc-600">
+            {prettyDate}
+          </div>
+          <Button
+            variant="outline"
+            disabled={!layoutInfo}
+            onClick={() => setCustomizing(true)}
+            title={t("Choose what Today shows")}
+          >
+            <SlidersHorizontal className="size-4" aria-hidden />
+            {t("Customize")}
+          </Button>
         </div>
       </div>
 
       {error && (
         <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
-          {error}
+          {translate(error)}
         </div>
       )}
 
-      <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-        <StatCard
-          icon={<LogIn className="size-4" />}
-          label={t("Arrivals")}
-          value={arrivalsN}
-          spark={mkTrend(arrivalsN)}
-        />
-        <StatCard
-          icon={<LogOut className="size-4" />}
-          label={t("Departures")}
-          value={departuresN}
-          spark={mkTrend(departuresN, false)}
-          sparkColor="var(--color-amber-600)"
-        />
-        <StatCard
-          icon={<Users className="size-4" />}
-          label={t("In-house")}
-          value={inhouseN}
-          spark={mkTrend(inhouseN)}
-        />
-        <StatCard
-          icon={<PieChart className="size-4" />}
-          label={t("Occupancy")}
-          value={`${occupancyPct}%`}
-          progress={occupancyPct}
-          progressLabel={t("{occupied} of {total} rooms", {
-            occupied: occupied ?? 0,
-            total: roomsN,
-          })}
-        />
-        <StatCard
-          icon={<Wallet className="size-4" />}
-          label={t("Revenue")}
-          value={`${cur()}${inr0(revenue)}`}
-          sub={t("RevPAR {amount}", { amount: `${cur()}${inr0(revpar)}` })}
-          spark={mkTrend(revenue)}
-        />
-        <StatCard
-          icon={<ListChecks className="size-4" />}
-          label={t("Open tasks")}
-          value={tasksN}
-          sub={overdueN ? t("{n} overdue", { n: overdueN }) : undefined}
-        />
+      {top.map((id) => (
+        <div key={id}>{widgets[id]}</div>
+      ))}
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+        {left.length > 0 && (
+          <div className={cn("min-w-0 space-y-4", right.length ? "lg:col-span-2" : "lg:col-span-5")}>
+            {left.map((id) => (
+              <div key={id} className="min-w-0">
+                {widgets[id]}
+              </div>
+            ))}
+          </div>
+        )}
+        {right.length > 0 && (
+          <div className={cn("min-w-0 space-y-4", left.length ? "lg:col-span-3" : "lg:col-span-5")}>
+            {right.map((id) => (
+              <div key={id} className="min-w-0">
+                {widgets[id]}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
-
-      <div className="grid gap-4 lg:grid-cols-5">
-        <div className="space-y-4 lg:col-span-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("Arrivals")}</CardTitle>
-              <LogIn className="size-4 text-zinc-400" aria-hidden />
-            </CardHeader>
-            <CardContent className="pt-1">
-              <ReservationList
-                rows={snap?.arrivals ?? []}
-                empty={t("No arrivals expected today.")}
-                action={(row) => (
-                  <Button
-                    disabled={busy === row.name}
-                    onClick={() => setCheckingIn(row.name)}
-                  >
-                    {t("Check in")}
-                  </Button>
-                )}
-              />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("Departures")}</CardTitle>
-              <LogOut className="size-4 text-zinc-400" aria-hidden />
-            </CardHeader>
-            <CardContent className="pt-1">
-              <ReservationList
-                rows={snap?.departures ?? []}
-                empty={t("No departures due today.")}
-                action={(row) => (
-                  <Button
-                    variant="outline"
-                    disabled={busy === row.name}
-                    onClick={() => act(row.name, () => checkOut(row.name))}
-                  >
-                    {t("Check out")}
-                  </Button>
-                )}
-              />
-            </CardContent>
-          </Card>
-        </div>
-
-        <div className="space-y-4 lg:col-span-3">
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("Room board")}</CardTitle>
-              <span className="text-xs text-zinc-400">
-                {t("Click a room to advance its housekeeping status")}
-              </span>
-            </CardHeader>
-            <CardContent>
-              <div className="mb-3 flex flex-wrap gap-1 border-b border-zinc-100">
-                {["All", ...floors].map((f) => (
-                  <button
-                    key={f}
-                    onClick={() => setFloor(f)}
-                    className={cn(
-                      "relative px-3 py-1.5 text-sm font-medium",
-                      floor === f
-                        ? "text-brand-700"
-                        : "text-zinc-500 hover:text-zinc-700",
-                    )}
-                  >
-                    {f === "All" ? t("All Floors") : ordinalFloor(f, t)}
-                    {floor === f && (
-                      <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-brand-600" />
-                    )}
-                  </button>
-                ))}
-              </div>
-              <div className="space-y-3">
-                {shownFloors.map((fl) => (
-                  <div key={fl} className="flex items-start gap-3">
-                    <div className="w-16 shrink-0 pt-2 text-xs font-medium text-zinc-500">
-                      {ordinalFloor(fl, t)}
-                    </div>
-                    <div className="grid flex-1 grid-cols-3 gap-2 sm:grid-cols-5 md:grid-cols-7">
-                      {allRooms
-                        .filter((r) => r.floor === fl)
-                        .map((room) => renderRoom(room))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2 text-xs text-zinc-500">
-                <Badge tone="green">{t("Clean")}</Badge>
-                <Badge tone="sky">{t("Inspected")}</Badge>
-                <Badge tone="amber">{t("Dirty")}</Badge>
-                <Badge tone="rose">{t("Out of Order")}</Badge>
-                <span className="inline-flex items-center gap-1">
-                  <BedDouble className="size-3.5" aria-hidden /> {t("occupied")}
-                </span>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("In-house guests")}</CardTitle>
-              <span className="text-xs text-zinc-400">
-                {t("{n} staying", { n: inhouseN })}
-              </span>
-            </CardHeader>
-            <CardContent className="pt-1">
-              <InHouseTable rows={snap?.in_house ?? []} today={snap?.date} />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("Housekeeping")}</CardTitle>
-              <span className="text-xs text-zinc-400">
-                {t("{pct}% occupied · {occupied} of {total}", {
-                  pct: occupancyPct,
-                  occupied: occupied ?? 0,
-                  total: roomsN,
-                })}
-              </span>
-            </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                {hkStats.map((s) => (
-                  <div
-                    key={s.label}
-                    className="flex items-center gap-2 rounded-lg border border-zinc-200 px-3 py-2"
-                  >
-                    <span className={cn("size-2 rounded-full", s.dot)} />
-                    <span className="text-lg font-semibold tabular-nums">
-                      {s.value}
-                    </span>
-                    <span className="text-xs text-zinc-500">{s.label}</span>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
+      {customizing && layoutInfo && (
+        <CustomizeToday
+          info={layoutInfo}
+          current={layout}
+          onClose={() => setCustomizing(false)}
+          onSaved={(info) => {
+            setLayoutInfo(info)
+            setLayout(info.layout)
+          }}
+        />
+      )}
+      {checkingOut && (
+        <CheckOutDialog
+          reservation={checkingOut}
+          onClose={() => setCheckingOut(null)}
+          onDone={() => {
+            setCheckingOut(null)
+            setPanelKey((k) => k + 1)
+            void refresh()
+          }}
+          onOpenReservation={(name) => setCheckingOut(name)}
+        />
+      )}
+      {roomPanel && !checkingOut && !checkingIn && !moving && (
+        <RoomDrawer
+          room={roomPanel.room}
+          initialTab={roomPanel.tab}
+          reloadKey={panelKey}
+          onClose={() => setRoomPanel(null)}
+          onChanged={() => void refresh()}
+          onCheckOut={setCheckingOut}
+          onCheckIn={setCheckingIn}
+          onMove={(res, number) => setMoving({ res, number })}
+        />
+      )}
+      {moving && (
+        <RoomChangeDialog
+          reservation={moving.res}
+          currentRoomNumber={moving.number}
+          onClose={() => setMoving(null)}
+          onMoved={() => {
+            setMoving(null)
+            setPanelKey((k) => k + 1)
+            void refresh()
+          }}
+        />
+      )}
       {checkingIn && (
         <CheckInDialog
           reservation={checkingIn}
           onClose={() => setCheckingIn(null)}
           onDone={() => {
             setCheckingIn(null)
+            setPanelKey((k) => k + 1)
+            refresh()
+          }}
+        />
+      )}
+      {markingNoShow && (
+        <NoShowDialog
+          reservation={markingNoShow}
+          onClose={() => setMarkingNoShow(null)}
+          onDone={() => {
+            setMarkingNoShow(null)
+            setPanelKey((k) => k + 1)
             refresh()
           }}
         />

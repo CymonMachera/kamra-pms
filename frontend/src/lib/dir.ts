@@ -15,20 +15,35 @@ export interface LangDef {
 /** Supported UI languages. Add a row + a locales/<code>.json to ship another. */
 export const LANGS: LangDef[] = [
   { code: "en", nativeLabel: "English", englishLabel: "English", dir: "ltr" },
+  { code: "es", nativeLabel: "Español", englishLabel: "Spanish", dir: "ltr" },
+  { code: "pt", nativeLabel: "Português", englishLabel: "Portuguese", dir: "ltr" },
   { code: "ar", nativeLabel: "العربية", englishLabel: "Arabic", dir: "rtl" },
 ]
 
 export type Lang = string
 
-const KEY = "kamra-lang"
+// Guest pages keep their own choice: a guest (or staff previewing /book)
+// picking Spanish there must not switch the desk, and the reverse.
+const GUEST_PAGE = /^(\/kamra)?\/(book|stay|checkin)(\/|$)/
+const key = () => (GUEST_PAGE.test(window.location.pathname) ? "kamra-guest-lang" : "kamra-lang")
 const codes = new Set(LANGS.map((l) => l.code))
 
 export function langDef(code: string): LangDef {
   return LANGS.find((l) => l.code === code) ?? LANGS[0]
 }
 
+// A guest page's language before the guest picks one: the hotel's booking
+// engine default, else the browser's. Not stored, so a later default applies.
+let guestDefault: Lang | null = null
+
 export const getLang = (): Lang => {
-  const raw = localStorage.getItem(KEY) || "en"
+  let raw: string | null = null
+  try {
+    raw = localStorage.getItem(key())
+  } catch {
+    /* private mode */
+  }
+  raw = raw || (key() === "kamra-guest-lang" ? guestDefault : null) || "en"
   return codes.has(raw) ? raw : "en"
 }
 
@@ -41,13 +56,43 @@ export function applyLang(l: Lang) {
 
 export function setLang(l: Lang) {
   const code = codes.has(l) ? l : "en"
-  localStorage.setItem(KEY, code)
+  localStorage.setItem(key(), code)
   applyLang(code)
-  // let listeners (React trees) re-render with the new direction/strings
-  window.dispatchEvent(new Event("kamra:lang"))
+  // Load the dictionary before notifying listeners so the first paint
+  // after a switch is already translated (see lib/locales.ts).
+  void import("./locales").then(({ ensureDictionary }) =>
+    ensureDictionary(code).then(() => {
+      window.dispatchEvent(new Event("kamra:lang"))
+    }),
+  )
 }
 
-/** Call once at boot. */
-export function initLang() {
-  applyLang(getLang())
+/** Guest pages: the guest's own pick wins; until then the hotel's booking
+ * engine language (`preferred`), else the browser language. */
+export function adoptGuestLanguage(preferred?: string | null) {
+  const browser = navigator.language?.toLowerCase().split("-")[0]
+  const next = [preferred, browser].find((c) => c && codes.has(c)) ?? null
+  if (next === guestDefault) return
+  guestDefault = next
+  syncLang()
+}
+
+/** Re-apply after moving between a guest page and the desk in one tab. */
+export function syncLang() {
+  const code = getLang()
+  applyLang(code)
+  void import("./locales").then(({ ensureDictionary }) =>
+    ensureDictionary(code).then(() => {
+      window.dispatchEvent(new Event("kamra:lang"))
+    }),
+  )
+}
+
+/** Call once at boot. Prefetch the active dictionary so t() is ready
+ *  before React mounts (avoids a flash of English on Arabic desks). */
+export async function initLang() {
+  const code = getLang()
+  applyLang(code)
+  const { ensureDictionary } = await import("./locales")
+  await ensureDictionary(code)
 }

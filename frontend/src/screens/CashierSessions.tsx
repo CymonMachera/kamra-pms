@@ -4,6 +4,7 @@ import { call, getCurrentProperty } from "../lib/api"
 import { serverError } from "../lib/resource"
 import { Badge } from "../components/ui/badge"
 import { moneyLocale } from "../lib/money"
+import { t as translate, useUILanguage } from "../lib/i18n"
 
 const inr = (n: unknown) =>
   Number(n ?? 0).toLocaleString(moneyLocale(), { maximumFractionDigits: 0 })
@@ -24,6 +25,7 @@ type Row = {
 }
 
 export default function CashierSessions() {
+  useUILanguage()
   const [rows, setRows] = useState<Row[]>([])
   const [date, setDate] = useState("")
   const [err, setErr] = useState<string | null>(null)
@@ -49,38 +51,44 @@ export default function CashierSessions() {
   }, [load])
 
   return (
-    <div className="mx-auto max-w-5xl space-y-4 p-4 sm:p-6">
+    <div className="w-full max-w-none space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">
-            Cashier
-          </p>
-          <h1 className="text-2xl font-semibold">Sessions</h1>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">{translate("Cashier")}</p>
+          <h1 className="text-2xl font-semibold">{translate("Sessions")}</h1>
+          <p className="mt-1 max-w-2xl text-sm text-zinc-500">{translate("Open and close tills on")}{" "}
+            <Link to="/cashier" className="font-medium text-brand-700 hover:underline">{translate("My Till")}</Link>{translate(". There is no separate “create till” form - opening a session starts the shift.")}</p>
         </div>
-        <label className="text-sm">
-          <span className="mr-2 text-zinc-500">Business date</span>
-          <input
-            type="date"
-            className="rounded-lg border border-zinc-300 px-2 py-1.5"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-          />
-        </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <Link
+            to="/cashier"
+            className="rounded-lg bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700"
+          >{translate("Open / close till")}</Link>
+          <label className="text-sm">
+            <span className="mr-2 text-zinc-500">{translate("Business date")}</span>
+            <input
+              type="date"
+              className="rounded-lg border border-zinc-300 px-2 py-1.5"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+            />
+          </label>
+        </div>
       </div>
       {err ? (
-        <p className="text-sm text-rose-600">{err}</p>
+        <p className="text-sm text-rose-600">{translate(err)}</p>
       ) : null}
       <div className="overflow-x-auto rounded-xl border border-zinc-200 bg-white">
-        <table className="w-full text-left text-sm">
+        <table className="w-full table-fixed text-left text-sm">
           <thead className="border-b border-zinc-100 text-xs uppercase tracking-wide text-zinc-400">
             <tr>
-              <th className="px-3 py-2">Cashier</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Float</th>
-              <th className="px-3 py-2">Cash</th>
-              <th className="px-3 py-2">Expected</th>
-              <th className="px-3 py-2">Counted</th>
-              <th className="px-3 py-2">Variance</th>
+              <th className="w-[28%] px-3 py-2">{translate("Cashier")}</th>
+              <th className="w-[12%] px-3 py-2">{translate("Status")}</th>
+              <th className="px-3 py-2">{translate("Float")}</th>
+              <th className="px-3 py-2">{translate("Cash")}</th>
+              <th className="px-3 py-2">{translate("Expected")}</th>
+              <th className="px-3 py-2">{translate("Counted")}</th>
+              <th className="px-3 py-2">{translate("Variance")}</th>
             </tr>
           </thead>
           <tbody>
@@ -97,7 +105,7 @@ export default function CashierSessions() {
                 </td>
                 <td className="px-3 py-2">
                   <Badge tone={r.status === "Open" ? "green" : "zinc"}>
-                    {r.status}
+                    {translate(r.status)}
                   </Badge>
                 </td>
                 <td className="px-3 py-2 tabular-nums">{inr(r.opening_float)}</td>
@@ -109,9 +117,8 @@ export default function CashierSessions() {
             ))}
             {!rows.length ? (
               <tr>
-                <td colSpan={7} className="px-3 py-8 text-center text-zinc-400">
-                  No sessions for this date.
-                </td>
+                <td colSpan={7} className="px-3 py-10 text-center text-zinc-400">{translate("No sessions for this date.")}{" "}
+                  <Link to="/cashier" className="text-brand-700 hover:underline">{translate("Open a till")}</Link>{" "}{translate("to start.")}</td>
               </tr>
             ) : null}
           </tbody>

@@ -11,10 +11,17 @@
   "column_break_a",
   "folio",
   "invoice_number",
+  "invoice_date",
+  "due_date",
   "debit",
   "credit",
   "reference",
-  "notes"
+  "notes",
+  "idempotency_key",
+  "received_on",
+  "reverses",
+  "disputed",
+  "dispute_note"
  ],
  "fields": [
   {
@@ -63,6 +70,18 @@
    "label": "Invoice Number"
   },
   {
+   "fieldname": "invoice_date",
+   "fieldtype": "Date",
+   "label": "Invoice Date",
+   "description": "When the bill was first raised, if earlier than this entry's posting date (a bill moved from another account). Aging and the due date count from it."
+  },
+  {
+   "fieldname": "due_date",
+   "fieldtype": "Date",
+   "label": "Due Date",
+   "description": "Invoice date + the account's credit days when the bill was raised."
+  },
+  {
    "fieldname": "debit",
    "fieldtype": "Currency",
    "label": "Debit",
@@ -85,11 +104,50 @@
    "fieldname": "notes",
    "fieldtype": "Small Text",
    "label": "Notes"
+  },
+  {
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "description": "One per payment press: a retry with the same key posts nothing.",
+   "hidden": 1,
+   "no_copy": 1,
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "received_on",
+   "fieldtype": "Date",
+   "label": "Received On",
+   "description": "Payments: the date the bank or cashier received the money, when it is earlier than the posting (business) date."
+  },
+  {
+   "fieldname": "reverses",
+   "fieldtype": "Link",
+   "label": "Reverses",
+   "options": "City Ledger Entry",
+   "read_only": 1,
+   "search_index": 1,
+   "description": "The company payment this entry reverses (a bounced cheque, a payment on the wrong account)."
+  },
+  {
+   "fieldname": "disputed",
+   "fieldtype": "Check",
+   "label": "Disputed",
+   "default": "0",
+   "read_only": 1,
+   "description": "The company disputes this bill: no payment reminders, and it does not count towards the overdue credit block. It still shows in aging."
+  },
+  {
+   "fieldname": "dispute_note",
+   "fieldtype": "Small Text",
+   "label": "Dispute Note",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-09-07 00:00:00",
+ "modified": "2026-11-12 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Kamra",
  "name": "City Ledger Entry",
@@ -110,9 +168,6 @@
   {
    "role": "Hotel Admin",
    "read": 1,
-   "write": 1,
-   "create": 1,
-   "delete": 1,
    "export": 1,
    "print": 1,
    "report": 1,
@@ -122,8 +177,6 @@
   {
    "role": "Finance",
    "read": 1,
-   "write": 1,
-   "create": 1,
    "export": 1,
    "print": 1,
    "report": 1,
@@ -132,8 +185,6 @@
   {
    "role": "Front Desk",
    "read": 1,
-   "write": 1,
-   "create": 1,
    "print": 1,
    "report": 1,
    "email": 1
@@ -141,8 +192,6 @@
   {
    "role": "Kamra Agent",
    "read": 1,
-   "write": 1,
-   "create": 1,
    "print": 1,
    "report": 1,
    "email": 1

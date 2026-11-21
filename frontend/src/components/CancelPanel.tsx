@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react"
+import { Link } from "react-router-dom"
 import { call } from "../lib/api"
 import { serverError } from "../lib/resource"
 import type { Row } from "../lib/resource"
 import { Button } from "./ui/button"
-import { toFullPath } from "../lib/routing"
 import { cur, moneyLocale } from "../lib/money"
-import { useT } from "../lib/i18n"
+import { useT, t as translate } from "../lib/i18n"
+
 
 /** Cancel a stay the right way: see what it costs, say why, get a
  * cancellation number the guest can keep. Lives in the reservation
@@ -68,12 +69,12 @@ export default function CancelPanel({ row, reload }: { row: Row; reload: () => v
             : t("No fee applied.")}{" "}
           {t("Give the guest the cancellation number.")}
         </p>
-        <a
-          href={toFullPath(`/cancelled/${encodeURIComponent(String(row.name))}`)}
+        <Link
+          to={`/cancelled/${encodeURIComponent(String(row.name))}`}
           className="mt-1.5 inline-block font-medium text-emerald-900 underline"
         >
           {t("Print / share the confirmation letter")}
-        </a>
+        </Link>
       </div>
     )
 
@@ -114,7 +115,7 @@ export default function CancelPanel({ row, reload }: { row: Row; reload: () => v
               onChange={(e) => setReason(e.target.value)}
             >
               {REASONS.map((r) => (
-                <option key={r}>{t(r)}</option>
+                <option key={r} value={r}>{t(r)}</option>
               ))}
             </select>
           </label>
@@ -166,7 +167,7 @@ export default function CancelPanel({ row, reload }: { row: Row; reload: () => v
               {t("Keep the booking")}
             </Button>
           </div>
-          {error && <p className="text-xs text-rose-600">{error}</p>}
+          {error && <p className="text-xs text-rose-600">{translate(error)}</p>}
         </div>
       )}
     </div>
