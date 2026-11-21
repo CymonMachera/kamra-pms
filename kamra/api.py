@@ -22,7 +22,8 @@ ALL_MODULES = ("front-desk", "housekeeping", "operations", "fnb", "events",
 
 @frappe.whitelist()
 @require_roles("Front Desk", "Finance", "Revenue Manager", "Housekeeping",
-               "Housekeeping Supervisor", "Kamra Agent", "Night Auditor", "F&B Manager")
+               "Housekeeping Supervisor", "Kamra Agent", "Night Auditor", "F&B Manager",
+               "Hotel Owner")
 def enabled_modules(property: str) -> list:
 	"""Which parts of Kamra this property runs. Empty setting = all of
 	them, so an existing property keeps working untouched."""
@@ -731,7 +732,8 @@ def registration_card(reservation: str):
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Front Desk", "Night Auditor", "Revenue Manager", "Kamra Agent")
+@require_roles("Finance", "Front Desk", "Night Auditor", "Revenue Manager", "Kamra Agent",
+               "Hotel Owner")
 def cash_summary(property: str, date: str | None = None,
                  to_date: str | None = None):
 	"""Cashier reconciliation: what the system says was collected today,

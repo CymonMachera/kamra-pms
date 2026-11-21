@@ -186,7 +186,7 @@ def _open_folio_totals(property: str) -> tuple[float, int]:
 
 @frappe.whitelist()
 @require_roles("Front Desk", "Finance", "Revenue Manager", "Night Auditor", "Hotel Admin",
-               "Kamra Agent")
+               "Kamra Agent", "Hotel Owner")
 def property_dashboard(property: str, date: str | None = None, with_comparison: int = 0):
 	"""Everything one hotel's dashboard needs, by department. The year on
 	year comparison is heavy, so only the Dashboard screen asks for it."""
@@ -298,7 +298,7 @@ def _property_summary(property: str, date: str):
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Revenue Manager", "Hotel Admin", "Kamra Agent")
+@require_roles("Finance", "Revenue Manager", "Hotel Admin", "Kamra Agent", "Hotel Owner")
 def portfolio_dashboard(date: str | None = None):
 	"""The chain's central view: headline metrics rolled up across every
 	property the signed-in user may access, plus a per-property table."""
@@ -326,7 +326,7 @@ def portfolio_dashboard(date: str | None = None):
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Revenue Manager", "Night Auditor", "Kamra Agent")
+@require_roles("Finance", "Revenue Manager", "Night Auditor", "Kamra Agent", "Hotel Owner")
 def owner_snapshot(property: str, date: str | None = None, from_date: str | None = None,
                    period: str | None = None):
 	"""The owner's phone view of one hotel: the flash for a day (or

@@ -6,6 +6,8 @@ AGENT_ROLE = "Kamra Agent"
 
 # business roles a hotel assigns to staff that no doctype perm creates
 STAFF_ROLES = ("Housekeeping Supervisor", "Night Auditor", "F&B Manager",
+               # view-only owner (Machera): dashboards, never a write
+               "Hotel Owner",
                # service account of a third-party POS (kamra.pos_interface)
                "POS Integrator")
 
@@ -57,7 +59,12 @@ def ensure_staff_roles():
 			frappe.get_doc({
 				"doctype": "Role", "role_name": role, "desk_access": 0,
 			}).insert(ignore_permissions=True)
+	# A user whose roles all lack desk access is turned into a Website User
+	# (a guest), so the view-only owner's only role must count as staff.
+	if not frappe.db.get_value("Role", "Hotel Owner", "desk_access"):
+		frappe.db.set_value("Role", "Hotel Owner", "desk_access", 1)
 	_mirror_custom_perms("Housekeeping", "Housekeeping Supervisor")
+	_owner_read_custom_perms()
 
 
 def _mirror_custom_perms(from_role: str, to_role: str):
@@ -80,6 +87,24 @@ def _mirror_custom_perms(from_role: str, to_role: str):
 		                **{f: cp.get(f) for f in flags}}).insert(
 			ignore_permissions=True)
 		frappe.clear_cache(doctype=cp.parent)
+
+
+def _owner_read_custom_perms():
+	"""Machera: the view-only Hotel Owner reads the doctypes its JSON grants.
+	Where a site carries Custom DocPerms for one of them (they replace the
+	JSON perms), add a read/report/print row - never write - for the owner."""
+	for dt in frappe.get_all("DocPerm", filters={"role": "Hotel Owner", "read": 1},
+	                         pluck="parent"):
+		if not frappe.db.exists("Custom DocPerm", {"parent": dt}):
+			continue
+		if frappe.db.exists("Custom DocPerm", {"parent": dt, "role": "Hotel Owner",
+		                                       "permlevel": 0}):
+			continue
+		frappe.get_doc({"doctype": "Custom DocPerm", "parent": dt,
+		                "parenttype": "DocType", "parentfield": "permissions",
+		                "role": "Hotel Owner", "permlevel": 0,
+		                "read": 1, "report": 1, "print": 1}).insert(ignore_permissions=True)
+		frappe.clear_cache(doctype=dt)
 
 
 def ensure_agent_identity():

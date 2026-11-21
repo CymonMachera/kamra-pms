@@ -114,6 +114,21 @@ export interface AppDef {
 const DESK = import.meta.env.PROD ? "" : "http://localhost:8000"
 
 export const APPS: AppDef[] = [
+  // Machera: the view-only owner's whole world - figures, no controls
+  {
+    id: "owner",
+    name: "Owner",
+    icon: Smartphone,
+    tint: APP_TILE,
+    description: "How the hotels are doing today - occupancy, revenue and cash.",
+    roles: ["Hotel Owner"],
+    items: [
+      { to: "/owner", label: "Owner view", icon: Smartphone,
+        keywords: ["Phone", "Mobile", "Owner", "Flash", "MTD"] },
+      { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard,
+        keywords: ["Dashboard", "KPIs", "Portfolio", "All hotels"] },
+    ],
+  },
   {
     id: "front-desk",
     name: "Front Desk",

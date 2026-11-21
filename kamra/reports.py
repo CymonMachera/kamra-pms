@@ -193,7 +193,7 @@ def movement_counts(property: str, start: str, date: str) -> dict:
 
 
 @frappe.whitelist()
-@require_roles("Finance", "Revenue Manager", "Night Auditor", "Kamra Agent")
+@require_roles("Finance", "Revenue Manager", "Night Auditor", "Kamra Agent", "Hotel Owner")
 def manager_flash(property: str, date: str | None = None,
                   from_date: str | None = None):
 	"""The daily flash: yesterday's performance, month to date, today's
